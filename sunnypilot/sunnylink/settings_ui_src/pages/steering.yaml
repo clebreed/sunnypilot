@@ -255,3 +255,7 @@ sections:
       key: AutoLaneChangeTimer
       op: '>'
       value: 0
+  - key: RoadEdgeLaneChangeEnabled
+    widget: toggle
+    title: 'Block Lane Change: Road Edge Detection'
+    description: Blocks the lane change if the model sees a road edge on your signaled side.

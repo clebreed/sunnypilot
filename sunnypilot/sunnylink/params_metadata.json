@@ -1132,7 +1132,7 @@
   },
   "RoadEdgeLaneChangeEnabled": {
     "title": "Block Lane Change: Road Edge Detection",
-    "description": ""
+    "description": "Blocks lane changes when the model sees a road edge on the signaled side."
   },
   "RoadName": {
     "title": "Road Name",
