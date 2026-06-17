@@ -17,7 +17,7 @@ from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   NORMAL, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, A_CRUISE_MAX_V, RISE_RATE, SMOOTH_DECEL_BP, \
   SMOOTH_DECEL_V, BRAKE_DEEPENING_JERK, BRAKE_RELEASE_JERK, ACCEL_RISE_JERK, SMOOTH_DECEL_LOOKAHEAD_T, \
-  MIN_SMOOTH_BRAKE_NEED, HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED, \
+  MIN_SMOOTH_BRAKE_NEED, HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED, STOP_APPROACH_VEGO, \
   ONSET_JERK0, ONSET_JERK_GAIN, ONSET_GAP_SOFT, ONSET_GAP_GAIN, ONSET_JERK_MAX, ONSET_HANDBACK_JERK, \
   SOFT_ONSET_MAX_BRAKE_NEED, SOFT_ONSET_MAX_INSTANT_ACCEL, SOFT_ONSET_REARM_FRAMES
 
@@ -87,6 +87,14 @@ class AccelController:
 
     self._bypassed = self._emergency_bypass(raw_target_accel, should_stop)
     if self._bypassed:
+      self._reset_onset()
+      return self._passthrough(raw_target_accel)
+
+    # Low-speed creep-to-stop: stand down (incl. the brake_need-driven front-load, which softens even
+    # when raw~0). Softening the final approach to a stopped lead makes the car brake less -> coast
+    # farther -> halt too close (~1.3 m). Hand full stock decel through so it stops at the proper gap.
+    # Onset shaping still applies above STOP_APPROACH_VEGO.
+    if self._v_ego < STOP_APPROACH_VEGO:
       self._reset_onset()
       return self._passthrough(raw_target_accel)
 

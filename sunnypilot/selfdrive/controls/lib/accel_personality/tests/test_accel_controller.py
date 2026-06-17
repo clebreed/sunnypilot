@@ -107,6 +107,19 @@ def test_early_soft_braking_brakes_before_plan():
   assert ctrl.brake_need() == pytest.approx(1.0)
 
 
+def test_low_speed_stop_approach_stands_down():
+  # Below STOP_APPROACH_VEGO the shaper must NOT soften the creep-to-stop (softening -> coast farther ->
+  # halt too close). Full stock decel passes through; onset shaping re-engages above the threshold.
+  ctrl = make_controller(personality=ECO)
+  ctrl.update({'carState': SimpleNamespace(vEgo=2.0)})
+  out = ctrl.smooth_target_accel(-0.1, flat_traj(-1.0), T_IDXS, should_stop=False)
+  assert not ctrl.smooth_active()
+  assert out == pytest.approx(-0.1, abs=_EPS)             # stock passthrough, no front-load softening
+  ctrl.update({'carState': SimpleNamespace(vEgo=8.0)})
+  ctrl.smooth_target_accel(-0.1, flat_traj(-1.0), T_IDXS, should_stop=False)
+  assert ctrl.smooth_active()                             # onset shaping still active above the threshold
+
+
 @pytest.mark.parametrize("personality", [ECO, NORMAL, SPORT])
 def test_never_weaker_than_plan_sustained_closing(personality):
   # NORMAL/off: strict never-weaker (route 000003da regression guard). ECO/SPORT: the convex onset may

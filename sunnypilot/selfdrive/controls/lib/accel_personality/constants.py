@@ -47,6 +47,11 @@ MIN_SMOOTH_BRAKE_NEED = 0.2
 HARD_BRAKE_TARGET_ACCEL = -1.5
 HARD_BRAKE_NEED = 2.6
 
+# Below this ego speed the shaper stands down (full stock decel). Softening the creep-to-stop makes the
+# car brake less -> coast farther -> halt too close to a stopped lead (~1.3 m). Stock decel below this
+# speed stops at the proper gap; sub-3 m/s braking is gentle anyway. Onset shaping applies above it.
+STOP_APPROACH_VEGO = 3.0       # m/s
+
 # --- Convex brake-onset shaper (param-gated; ECO/SPORT only, NORMAL = stock passthrough) ---
 # The grabby bite is the raw MPC plan: stock deepening uses a CONSTANT jerk (integrates to a LINEAR
 # accel ramp) and min(slewed,raw) lets the deep raw plan win, so the bite passes through untouched.
@@ -58,7 +63,7 @@ HARD_BRAKE_NEED = 2.6
 # No velocity-debt feedback: it carried stale state across closely-spaced stop-and-go brakes and
 # over-braked the next onset (verified). NORMAL omitted -> shaper never runs.
 ONSET_JERK0 = {ECO: 0.15, SPORT: 0.25}        # m/s^3  initial gentle jerk at the bite (target band 0.15-0.25)
-ONSET_JERK_GAIN = {ECO: 1.2, SPORT: 2.0}      # 1/s    depth-proportional growth rate k (convex; bigger -> faster)
+ONSET_JERK_GAIN = {ECO: 0.9, SPORT: 1.5}      # 1/s    depth-proportional growth rate k (lowered: gentler jerk-build = smoother decel, less "jerky")
 
 # Bounded softening: the gentle bite lags the plan (brakes shallower) at the very start. To keep the
 # softening modest (so it never feels like "no brakes"), an INSTANTANEOUS-gap catch-up adds jerk when
@@ -67,11 +72,11 @@ ONSET_JERK_GAIN = {ECO: 1.2, SPORT: 2.0}      # 1/s    depth-proportional growth
 # softening then settles near ONSET_GAP_SOFT; the hard cap keeps the catch from ever being a grab.
 ONSET_GAP_SOFT = {ECO: 0.30, SPORT: 0.25}     # m/s^2  tolerated shallower-than-plan gap before catch-up
 ONSET_GAP_GAIN = {ECO: 4.0, SPORT: 5.0}       # 1/s    extra jerk per m/s^2 of gap beyond ONSET_GAP_SOFT
-ONSET_JERK_MAX = {ECO: 1.4, SPORT: 1.8}       # m/s^3  hard ceiling on convex-path jerk while still armed/gentle
+ONSET_JERK_MAX = {ECO: 1.1, SPORT: 1.4}       # m/s^3  hard ceiling on convex-path jerk (lowered: smoother catch-up)
 # Fast hand-back: once the plan leaves the gentle zone (no longer armed) but a soft gap is still open,
 # close it at this FIRM jerk so the output catches the plan BEFORE braking gets firm -> no late-brake lag
 # into the [-1.5,-1.0] band. Jerk-limited (not a snap), and never deeper than the plan, so not a grab.
-ONSET_HANDBACK_JERK = {ECO: 3.0, SPORT: 4.0}  # m/s^3  gap-close rate when the plan has firmed past the gentle zone
+ONSET_HANDBACK_JERK = {ECO: 2.2, SPORT: 3.0}  # m/s^3  gap-close rate (lowered: gentler hand-back = less jounce/jerk)
 
 # Arm gates (conservative). Only shape genuinely gentle onsets; firm/deep onsets fall to the stock
 # never-weaker slew (they SHOULD bite). Two independent safety layers against late braking: (1) the
