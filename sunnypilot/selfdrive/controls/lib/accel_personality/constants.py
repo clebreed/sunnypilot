@@ -47,10 +47,13 @@ MIN_SMOOTH_BRAKE_NEED = 0.2
 HARD_BRAKE_TARGET_ACCEL = -1.5
 HARD_BRAKE_NEED = 2.6
 
-# Below this ego speed the shaper stands down (full stock decel). Softening the creep-to-stop makes the
-# car brake less -> coast farther -> halt too close to a stopped lead (~1.3 m). Stock decel below this
-# speed stops at the proper gap; sub-3 m/s braking is gentle anyway. Onset shaping applies above it.
-STOP_APPROACH_VEGO = 3.0       # m/s
+# Stop-imminent stand-down. The shaper's gentle bite is softer than the plan, so on a STOP approach it
+# coasts the car in -> halts too close / "stop-roll-stop" creep. When the plan predicts a near-stop
+# within the lookahead, stand the shaper down (full stock decel) so it stops at the proper gap with no
+# coast. Keyed on the PREDICTED speed reaching ~0 (covers lead AND light/sign stops), NOT raw ego speed
+# -- so non-stop low-speed braking (slowing to a moving follow) keeps the gentle onset at every speed.
+STOP_IMMINENT_VEGO = 1.0          # m/s  plan-predicted speed below this within the lookahead == stop coming
+STOP_IMMINENT_LOOKAHEAD_T = 3.0   # s
 
 # --- Convex brake-onset shaper (param-gated; ECO/SPORT only, NORMAL = stock passthrough) ---
 # The grabby bite is the raw MPC plan: stock deepening uses a CONSTANT jerk (integrates to a LINEAR

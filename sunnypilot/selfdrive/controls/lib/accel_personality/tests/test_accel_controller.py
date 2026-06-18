@@ -107,17 +107,18 @@ def test_early_soft_braking_brakes_before_plan():
   assert ctrl.brake_need() == pytest.approx(1.0)
 
 
-def test_low_speed_stop_approach_stands_down():
-  # Below STOP_APPROACH_VEGO the shaper must NOT soften the creep-to-stop (softening -> coast farther ->
-  # halt too close). Full stock decel passes through; onset shaping re-engages above the threshold.
+def test_stop_imminent_stands_down_but_moving_follow_shapes():
+  # Stop coming (plan speed -> ~0): stand down to stock decel so the gentle bite can't coast into the
+  # stop (creep). Slowing to a MOVING follow (plan stays > STOP_IMMINENT_VEGO): gentle onset stays active
+  # at every speed -> the gentle-brake goal is not regressed.
   ctrl = make_controller(personality=ECO)
-  ctrl.update({'carState': SimpleNamespace(vEgo=2.0)})
-  out = ctrl.smooth_target_accel(-0.1, flat_traj(-1.0), T_IDXS, should_stop=False)
+  stopping = [3.0, 2.0, 1.0, 0.4, 0.0] + [0.0] * (len(T_IDXS) - 5)
+  out = ctrl.smooth_target_accel(-0.1, flat_traj(-1.0), T_IDXS, should_stop=False, speed_trajectory=stopping)
   assert not ctrl.smooth_active()
-  assert out == pytest.approx(-0.1, abs=_EPS)             # stock passthrough, no front-load softening
-  ctrl.update({'carState': SimpleNamespace(vEgo=8.0)})
-  ctrl.smooth_target_accel(-0.1, flat_traj(-1.0), T_IDXS, should_stop=False)
-  assert ctrl.smooth_active()                             # onset shaping still active above the threshold
+  assert out == pytest.approx(-0.1, abs=_EPS)             # stock passthrough into the stop, no softening
+  moving = [8.0] * len(T_IDXS)                            # slowing to a moving follow, not a stop
+  ctrl.smooth_target_accel(-0.1, flat_traj(-1.0), T_IDXS, should_stop=False, speed_trajectory=moving)
+  assert ctrl.smooth_active()                             # gentle onset preserved (not stop-imminent)
 
 
 @pytest.mark.parametrize("personality", [ECO, NORMAL, SPORT])

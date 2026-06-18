@@ -172,7 +172,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     # Acceleration Personality: early soft braking (never weaker than the plan). No-op when disabled.
     output_a_target = self.accel.smooth_target_accel(output_a_target, self.a_desired_trajectory, CONTROL_N_T_IDX,
-                                                     self.output_should_stop or force_slow_decel, reset=reset_state, stock_brake=is_e2e)
+                                                     self.output_should_stop or force_slow_decel, reset=reset_state, stock_brake=is_e2e,
+                                                     speed_trajectory=self.v_desired_trajectory)
 
     # Lower (braking) bound and the ceiling's downward slew stay at the stock rate; only the ceiling's
     # upward slew is tier-dependent (Acceleration Personality).
