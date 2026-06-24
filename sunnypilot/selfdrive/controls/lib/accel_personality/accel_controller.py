@@ -4,11 +4,13 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Acceleration personality: per-profile launch/cruise accel ceiling (ECO/NORMAL/SPORT) plus an
-anticipatory brake front-load. SAFETY INVARIANT: on the brake side the output is NEVER WEAKER than the
-plan -- it can only be EQUAL or DEEPER (front-load). It never softens, delays, or rate-limits a brake,
-so it can never under-brake a closing lead. Hard brakes, stops and low speed pass the plan straight
-through (stock). Disabled => byte-stock.
+Acceleration personality: per-profile launch/cruise accel ceiling (ECO/NORMAL/SPORT), an anticipatory
+brake front-load, and a low-speed comfort stop. SAFETY: a firm/closing brake -- emergency (raw <=
+HARD_BRAKE_TARGET_ACCEL or brake_need >= HARD_BRAKE_NEED), FCW/crash, should_stop, or blended/e2e -- passes
+the plan straight through at full strength and rate, never softened/delayed/rate-limited. Only on the
+NON-emergency comfort path may the onset arrive spread by at most ONSET_SPREAD_MAX (a tightly bounded,
+transient lag) so a gentle brake does not land as a step. The front-load and comfort stop only ever ADD
+braking (min(., plan)). Disabled => byte-stock.
 """
 
 from collections.abc import Sequence
@@ -25,8 +27,9 @@ from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants imp
   STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, SMOOTH_DECEL_BP, SMOOTH_DECEL_V, BRAKE_DEEPENING_JERK, \
   BRAKE_RELEASE_JERK, ACCEL_RISE_JERK, SMOOTH_DECEL_LOOKAHEAD_T, MIN_SMOOTH_BRAKE_NEED, \
   HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED, OVERBITE_CAP, STOP_PASSTHROUGH_V, \
-  STOP_IMMINENT_VEGO, STOP_IMMINENT_LOOKAHEAD_T, \
-  STOP_ENFORCE_V, STOP_ENFORCE_DIST, STOP_ENFORCE_RANGE, STOP_ENFORCE_LEAD_V, STOP_ENFORCE_MAX_DECEL, STOP_ENFORCE_MIN_GAP
+  STOP_IMMINENT_VEGO, STOP_IMMINENT_LOOKAHEAD_T, ONSET_SPREAD_MAX, ONSET_SPREAD_JERK, \
+  COMFORT_STOP_V, COMFORT_STOP_LEAD_V, COMFORT_STOP_GAP, COMFORT_STOP_MIN_GAP, \
+  COMFORT_STOP_MAX_DECEL, COMFORT_STOP_JERK, COMFORT_STOP_RELEASE_V, COMFORT_STOP_HOLD_GAP
 
 _ZERO_ACCEL_EPS = 1e-6
 
@@ -48,6 +51,7 @@ class AccelController:
     self._lead_status = False
     self._lead_d = 0.0
     self._lead_vlead = 0.0
+    self._stop_floor = 0.0       # comfort-stop floor latch (monotone within a stop episode, eased on release)
     self._read_params()
 
   def _read_params(self) -> None:
@@ -88,11 +92,11 @@ class AccelController:
     self._smooth_active = False
     self._bypassed = False
 
-    out = self._shape(raw, should_stop, reset, speed_trajectory, t_idxs)
-    out = self._stop_enforce(out)   # never-weaker low-speed floor: no creep inside the target stop gap
+    out = self._shape(raw, should_stop, reset, speed_trajectory, t_idxs, stock_brake)
+    out = self._comfort_stop(out, reset)   # low-speed monotone comfort decel-to-stop (replaces the self-releasing enforcer)
     return self._finalize(out)
 
-  def _shape(self, raw: float, should_stop: bool, reset: bool, speed_trajectory, t_idxs) -> float:
+  def _shape(self, raw: float, should_stop: bool, reset: bool, speed_trajectory, t_idxs, stock_brake: bool) -> float:
     # --- Full stock passthroughs (output is exactly the plan, no shaping) ---
     if reset or not self._enabled:
       return raw                                               # disabled / reset
@@ -100,29 +104,61 @@ class AccelController:
       return raw                                               # stop/creep regime: braking is stock (no coast-in)
     self._bypassed = self._emergency_bypass(raw, should_stop)
     if self._bypassed or self._stop_imminent(speed_trajectory, t_idxs):
-      return raw                                               # hard brake / coming stop: full strength, no delay
+      return raw                                               # emergency / coming stop: full strength, no delay
 
     # Anticipatory front-load, capped at OVERBITE_CAP below the live plan (avoids an abrupt over-bite on a
-    # cut-in brake_need spike). min(., raw) keeps the output never weaker than the plan -> never under-brakes.
+    # cut-in brake_need spike).
     target = raw
     if self._brake_need >= MIN_SMOOTH_BRAKE_NEED:
       self._smooth_active = True
       self._decel_target = max(self.get_decel_target(self._brake_need), raw - OVERBITE_CAP)
       target = min(raw, self._decel_target)
+      if raw > 0.0:
+        target = max(target, 0.0)                              # plan wants throttle -> ease the gas early, never fabricate a brake
     slewed = self._slew(target)
-    return min(slewed, raw) if raw < 0.0 else slewed
+    if raw >= 0.0:
+      return slewed
+    if stock_brake:
+      return min(slewed, raw)                                  # blended/e2e: the model owns the brake -> strict never-weaker
+    return self._onset_spread(slewed, raw)                     # non-emergency brake: bounded onset spread (<= ONSET_SPREAD_MAX weaker)
 
-  def _stop_enforce(self, out: float) -> float:
-    # Never-weaker low-speed floor: bring the car to rest at STOP_ENFORCE_DIST behind a near-stopped lead,
-    # so the stock MPC's crawl-creep cannot park us inside the target gap. Disabled => no-op (off==stock).
-    if not (self._enabled and self._lead_status and 0.1 < self._v_ego < STOP_ENFORCE_V
-            and self._lead_vlead < STOP_ENFORCE_LEAD_V
-            and 0.1 < self._lead_d < STOP_ENFORCE_DIST + STOP_ENFORCE_RANGE):   # only the final-approach creep zone
+  def _onset_spread(self, shaped: float, raw: float) -> float:
+    # Scoped softening: on a NON-emergency brake the onset may arrive spread instead of stepping to the plan.
+    # The output deepens toward the plan jerk-limited at ONSET_SPREAD_JERK and may lag it by at most
+    # ONSET_SPREAD_MAX -- a tightly bounded, transient weaker-than-plan window that smooths the felt onset.
+    # Emergency brakes never reach here (raw passthrough in _shape), so a genuine hard brake is never softened.
+    # The front-load still wins when it is deeper (anticipation preserved).
+    spread = max(raw, self._last_target_accel - ONSET_SPREAD_JERK * DT_MDL)   # deepen toward the plan, jerk-limited
+    spread = min(spread, raw + ONSET_SPREAD_MAX)                              # never more than the bounded lag weaker
+    return min(shaped, spread)
+
+  def _comfort_stop(self, out: float, reset: bool) -> float:
+    # Low-speed comfort decel-to-stop behind a near-stopped lead. Unlike the old enforcer it slews IN (no entry
+    # grab) and low-passes raw-radar dRel (deepening rate-limited). It tracks the kinematic decel a_req both ways
+    # while approaching, BUT holds strictly monotone (never weakens) inside the final-approach window so it cannot
+    # self-release into a roll; outside that window it may weaken at the release rate when a creeping lead pulls
+    # away (no phantom brake into an opening gap). min(out, floor) keeps it never weaker than the plan. Off => no-op.
+    if reset or not self._enabled:
+      self._stop_floor = 0.0                                   # disengaged/disabled: drop the latch, pure passthrough
       return out
-    gap = self._lead_d - STOP_ENFORCE_DIST                    # distance left before reaching the target gap
-    floor = -(self._v_ego ** 2) / (2.0 * max(gap, STOP_ENFORCE_MIN_GAP))   # gentle decel to stop at the target
-    floor = max(floor, STOP_ENFORCE_MAX_DECEL)                # cap -> gentle hold, never a grab
-    return min(out, floor)                                    # never weaker than the plan
+    engaged = (self._lead_status and self._lead_vlead < COMFORT_STOP_LEAD_V
+               and self._lead_d > 0.1 and self._v_ego < COMFORT_STOP_V)
+    if engaged and self._v_ego >= COMFORT_STOP_RELEASE_V:
+      gap = self._lead_d - COMFORT_STOP_GAP
+      a_req = max(-(self._v_ego ** 2) / (2.0 * max(gap, COMFORT_STOP_MIN_GAP)), COMFORT_STOP_MAX_DECEL)
+      lo = self._stop_floor - COMFORT_STOP_JERK * DT_MDL       # deepest allowed this frame (slew-in, no grab)
+      hi = self._stop_floor + BRAKE_RELEASE_JERK * DT_MDL      # shallowest allowed this frame (release rate)
+      tracked = min(hi, max(lo, a_req))                        # track a_req, rate-limited both directions
+      if gap > COMFORT_STOP_HOLD_GAP:
+        self._stop_floor = min(0.0, tracked)                   # gap still open -> may weaken if the lead pulls away
+      else:
+        self._stop_floor = min(tracked, self._stop_floor)      # final approach -> strict monotone hold (no roll)
+    else:
+      # Stop episode over (lead moving / launched / standstill handoff): ease the floor toward 0 at the release
+      # jerk. This matches _shape's own _slew_up release rate (BRAKE_RELEASE_JERK), so the floor decays in
+      # lockstep with the natural output -> no added launch drag, and no release-direction step (no snap).
+      self._stop_floor = min(0.0, self._stop_floor + BRAKE_RELEASE_JERK * DT_MDL)
+    return min(out, self._stop_floor) if self._stop_floor < 0.0 else out
 
   def _stop_imminent(self, speed_trajectory: Sequence[float] | None, t_idxs: Sequence[float]) -> bool:
     # plan predicts a near-stop within the lookahead -> a stop is coming (lead or light/sign).
@@ -193,3 +229,9 @@ class AccelController:
 
   def bypassed(self) -> bool:
     return self._bypassed
+
+  def comfort_stop_floor(self) -> float:
+    return self._stop_floor
+
+  def comfort_stop_active(self) -> bool:
+    return self._stop_floor < 0.0

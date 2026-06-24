@@ -307,6 +307,8 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     decelTarget @4 :Float32;  # early-soft comfort decel target (m/s^2, negative)
     smoothActive @5 :Bool;    # early-soft braking currently shaping the target
     bypassed @6 :Bool;        # passthrough to stock plan (hard brake / FCW / should_stop / closing lead / e2e)
+    comfortStopActive @7 :Bool;   # low-speed comfort decel-to-stop floor currently governing (behind a near-stopped lead)
+    comfortStopFloor @8 :Float32; # comfort-stop floor commanded (m/s^2, negative; 0 when not engaged)
   }
 
   enum AccelerationPersonality {

@@ -28,20 +28,21 @@ A_CRUISE_MAX_V = {
 RISE_RATE = {ECO: 0.10, NORMAL: 0.15, SPORT: 0.22}   # ceiling open-rate: all >> stock 0.05 for fast take-off
 
 # Anticipatory front-load: predicted brake need (m/s^2) -> early decel target (m/s^2). Starts a gentle
-# decel early when a brake is predicted, so it arrives spread out, not as one late firm onset. One-sided
-# (never weaker than the plan).
-SMOOTH_DECEL_BP = [0.0, 0.4, 0.8, 1.2, 1.6, 2.0, 2.4]
+# decel early when a brake is predicted, so it arrives spread out, not as one late firm onset. The first
+# knot sits AT the MIN_SMOOTH_BRAKE_NEED gate (0.00 there): below the gate there is no front-load, so there
+# is no dead [0, gate) anchor and no step at the gate (the old [0.0 -> 0.00] knot was never evaluated).
+SMOOTH_DECEL_BP = [0.4, 0.8, 1.2, 1.6, 2.0, 2.4]
 SMOOTH_DECEL_V = {
-  ECO:    [0.00, -0.08, -0.20, -0.35, -0.55, -0.78, -1.00],
-  NORMAL: [0.00, -0.13, -0.30, -0.55, -0.84, -1.12, -1.40],
-  SPORT:  [0.00, -0.17, -0.40, -0.72, -1.05, -1.35, -1.65],
+  ECO:    [0.00, -0.20, -0.35, -0.55, -0.78, -1.00],
+  NORMAL: [0.00, -0.30, -0.55, -0.84, -1.12, -1.40],
+  SPORT:  [0.00, -0.40, -0.72, -1.05, -1.35, -1.65],
 }
 BRAKE_DEEPENING_JERK = {ECO: 0.5, NORMAL: 0.8, SPORT: 1.0}
 BRAKE_RELEASE_JERK = 2.0
 ACCEL_RISE_JERK = {ECO: 1.0, NORMAL: 1.5, SPORT: 2.2}   # accel-onset jerk: higher = snappier take-off, stepped per tier
 
 SMOOTH_DECEL_LOOKAHEAD_T = 3.0
-MIN_SMOOTH_BRAKE_NEED = 0.2
+MIN_SMOOTH_BRAKE_NEED = 0.4   # below this no front-load (kills the faint low-brake_need drag + the gate-crossing toggle)
 
 # Cap how much DEEPER than the live plan the front-load may bite -> no abrupt over-bite on a cut-in
 # brake_need spike (binds only when the plan still wants throttle; once it brakes, the table wins).
@@ -59,15 +60,29 @@ HARD_BRAKE_NEED = 2.6
 STOP_IMMINENT_VEGO = 1.0          # m/s  plan-predicted speed below this within the lookahead == stop coming
 STOP_IMMINENT_LOOKAHEAD_T = 3.0   # s
 
-# Below this ego speed the brake side is stock passthrough, so stop distance is byte-identical to off.
+# Below this ego speed the brake side is stock passthrough (the comfort stop below adds the only low-speed
+# shaping); the bounded onset-spread does not run here, so a stock stop is not rate-limited.
 STOP_PASSTHROUGH_V = 5.0          # m/s
 
-# Low-speed stop-distance enforcer. The stock MPC loses gap-cost leverage at crawl and creeps inside
-# STOP_DISTANCE behind a stopped lead. This is a never-weaker floor: command the gentle decel that brings
-# the car to rest at STOP_ENFORCE_DIST and take min(plan, floor) -> only ever adds braking, self-targeting.
-STOP_ENFORCE_V = 5.0              # m/s: only enforce at/below this ego speed
-STOP_ENFORCE_DIST = 5.5          # m: target standstill gap (under STOP_DISTANCE=6 for the radar rear-of-lead offset)
-STOP_ENFORCE_RANGE = 3.0         # m: only within DIST+RANGE of the lead (final-approach creep zone)
-STOP_ENFORCE_LEAD_V = 1.5        # m/s: only behind a near-stopped lead
-STOP_ENFORCE_MAX_DECEL = -1.8    # m/s^2: cap -> always a gentle hold, never a grab
-STOP_ENFORCE_MIN_GAP = 0.5       # m: kinematic denominator floor
+# Scoped onset-spread -- the ONLY place the output may be transiently WEAKER than the plan. On a NON-emergency
+# brake the onset may arrive spread over a bounded ramp instead of stepping straight to the plan: the output
+# may lag the plan by at most ONSET_SPREAD_MAX, deepening toward it at ONSET_SPREAD_JERK. A firm/closing brake
+# (raw <= HARD_BRAKE_TARGET_ACCEL or brake_need >= HARD_BRAKE_NEED, FCW/crash, should_stop, blended/e2e) skips
+# this entirely (raw passthrough), so a real hard brake is never softened or delayed.
+ONSET_SPREAD_MAX = 0.25           # m/s^2: max the output may lag (be weaker than) the live plan, non-emergency only
+ONSET_SPREAD_JERK = 2.5           # m/s^3: rate the spread output deepens back toward the plan
+
+# Low-speed comfort stop. Behind a (near-)stopped lead, bring the car to rest at COMFORT_STOP_GAP with a
+# MONOTONE decel that slews IN (no entry grab) and never self-releases early (so the car does not roll the
+# final metre). min(plan, floor) keeps it never weaker than the plan; the monotone + slew-in also low-passes
+# raw-radar dRel steps (a farther/noisier dRel can only be ignored, never injected as a deeper grab). Replaces
+# the old self-releasing v^2/(2*gap) enforcer, which grabbed at v~3 then released into a roll. Off => no-op.
+COMFORT_STOP_V = 4.0              # m/s: only engage at/below this ego speed
+COMFORT_STOP_LEAD_V = 1.0         # m/s: only behind a (near-)stopped lead
+COMFORT_STOP_GAP = 5.0            # m: target standstill gap (radar dRel); roomier than the stock crawl-in (~3.7-4.4m)
+COMFORT_STOP_MIN_GAP = 1.0        # m: kinematic denominator floor (gentle; no 1/x blow-up near the target)
+COMFORT_STOP_MAX_DECEL = -1.6     # m/s^2: gentle cap -> never a grab
+COMFORT_STOP_JERK = 1.0           # m/s^3: slew-IN / deepen rate of the comfort floor (no step on engage)
+COMFORT_STOP_RELEASE_V = 0.3      # m/s: below this, ease the floor out (release jerk) -> smooth stock standstill handoff
+COMFORT_STOP_HOLD_GAP = 2.0       # m: within this of the target gap = final approach -> strict monotone hold (no roll);
+                                  # beyond it the floor may WEAKEN at the release rate if a creeping lead pulls away

@@ -156,6 +156,8 @@ class LongitudinalPlannerSP:
     acceleration.decelTarget = float(self.accel.decel_target())
     acceleration.smoothActive = self.accel.smooth_active()
     acceleration.bypassed = bool(self.accel.bypassed())
+    acceleration.comfortStopActive = bool(self.accel.comfort_stop_active())
+    acceleration.comfortStopFloor = float(self.accel.comfort_stop_floor())
 
 
     pm.send('longitudinalPlanSP', plan_sp_send)
