@@ -136,6 +136,35 @@ def test_vlead_damp_gated_off_reports_real_speed():
   assert rising.vLead == pytest.approx(25.0, abs=1e-6)          # no damp -> real speed
 
 
+# --- lead-instability detector (telemetry) -----------------------------------
+
+def test_stability_quiet_on_clean_lead():
+  c = ctrl()
+  for v in (18.0, 18.2, 17.9, 18.1, 18.0, 17.8):                # steady lead, small noise
+    c.smooth_radarstate(rs(lead(dRel=40.0, vLead=v)))
+  assert not c.lead_unstable()                                  # range < VLEAD_SPREAD -> stable
+
+def test_stability_flags_bimodal_lead():
+  c = ctrl()
+  for v in (12.0, 2.0, 12.0, 2.0, 12.0):                        # bouncing between two tracks
+    c.smooth_radarstate(rs(lead(dRel=60.0, vLead=v)))
+  assert c.lead_unstable()                                      # range 10 m/s > VLEAD_SPREAD -> unstable
+
+def test_stability_resets_on_dropout():
+  c = ctrl()
+  for v in (12.0, 2.0, 12.0, 2.0, 12.0):
+    c.smooth_radarstate(rs(lead(dRel=60.0, vLead=v)))
+  assert c.lead_unstable()
+  c.smooth_radarstate(rs(lead(status=False, dRel=0.0, modelProb=0.0)))   # lead drops
+  assert not c.lead_unstable()                                 # buffer cleared -> stable
+
+def test_stability_runs_even_when_disabled():
+  c = ctrl(enabled=False)                                      # telemetry runs regardless of RadarDistance gate
+  for v in (12.0, 2.0, 12.0, 2.0, 12.0):
+    c.smooth_radarstate(rs(lead(dRel=60.0, vLead=v)))
+  assert c.lead_unstable()
+
+
 def test_obstacle_monotone_during_hold():
   c = ctrl()
   for _ in range(3):

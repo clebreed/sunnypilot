@@ -158,6 +158,7 @@ class LongitudinalPlannerSP:
     acceleration.bypassed = bool(self.accel.bypassed())
     acceleration.comfortStopActive = bool(self.accel.comfort_stop_active())
     acceleration.comfortStopFloor = float(self.accel.comfort_stop_floor())
+    acceleration.leadUnstable = bool(self.radar_distance.lead_unstable())
 
 
     pm.send('longitudinalPlanSP', plan_sp_send)

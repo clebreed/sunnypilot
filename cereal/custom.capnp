@@ -309,6 +309,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     bypassed @6 :Bool;        # passthrough to stock plan (hard brake / FCW / should_stop / closing lead / e2e)
     comfortStopActive @7 :Bool;   # low-speed comfort decel-to-stop floor currently governing (behind a near-stopped lead)
     comfortStopFloor @8 :Float32; # comfort-stop floor commanded (m/s^2, negative; 0 when not engaged)
+    leadUnstable @9 :Bool;        # RadarDistance lead-instability telemetry (bimodal/bouncing radar lead; informational, no control effect yet)
   }
 
   enum AccelerationPersonality {
