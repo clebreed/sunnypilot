@@ -72,42 +72,11 @@ STOP_PASSTHROUGH_V = 5.0          # m/s
 ONSET_SPREAD_MAX = 0.25           # m/s^2: max the output may lag (be weaker than) the live plan, non-emergency only
 ONSET_SPREAD_JERK = 2.5           # m/s^3: rate the spread output deepens back toward the plan
 
-# Low-speed comfort stop = ANTI-CREEP HOLD (not a brake adder). In the final approach behind a (near-)stopped
-# lead it HOLDS the deepest decel the PLAN itself has commanded (gentle-capped), so the brake does not ease
-# off / creep in before the car is stopped (no roll, slightly roomier). It is NEVER firmer than the plan, so
-# it can never add a hard bite -- the stop stays as gentle as the plan's own decel. Outside the final approach
-# (cruising / gap opening as a creeping lead pulls away / lead moving / launch) the floor eases out at the
-# release rate. min(plan, floor) keeps it never weaker than the plan. Replaces the old kinematic v^2/(2*gap)
-# enforcer, which engaged late and demanded a firm ~-1.6 grab to hit a fixed gap. Off => no-op.
-COMFORT_STOP_ENABLED = False      # off: keeps the stock smooth taper (flat-hold firms the end). Farther-stop is via the MPC stop-target shift, not this.
-COMFORT_STOP_V = 4.0              # m/s: only engage at/below this ego speed
-COMFORT_STOP_LEAD_V = 1.0         # m/s: only behind a (near-)stopped lead
-COMFORT_STOP_GAP = 5.0            # m: reference standstill gap (radar dRel) for the final-approach window
-COMFORT_STOP_MAX_DECEL = -1.6     # m/s^2: backstop cap on the held decel (a brief plan spike is not held firmer than this)
-COMFORT_STOP_RELEASE_V = 0.3      # m/s: below this, ease the floor out (release rate) -> smooth stock standstill handoff
-COMFORT_STOP_HOLD_GAP = 2.0       # m: within this of the reference gap = final-approach window where the hold applies;
-                                  # beyond it the floor eases out (a creeping lead opening the gap -> no phantom brake)
-
-# Gas suppression near a lead: coast instead of accelerating toward a close lead, in two cases (OR) --
-# T1 we braked for it within RECENT_T and it is still not pulling away (closing < VREL); T2 we are clearly
-# gaining on it (closing < CLOSE). Only reduces accel, never a brake; opening/far lead keeps its gas.
-# Physics decel cap: on a closing lead with genuine room, don't brake HARDER than kinematics require to settle
-# at a comfortable gap (stock MPC over-brakes a slower lead at high speed via its big comfort-distance cost).
-# The ONLY feature that brakes LESS than stock -- guarded to roomy situations (TTC + distance), pessimistic
-# vRel margin, self-disengaging as room shrinks (full stock brake returns). Gated OFF by default.
-PHYSICS_CAP_ENABLED = False
-PHYS_CAP_MIN_TTC = 4.0            # s: only cap when TTC above this (room to brake gently)
-PHYS_CAP_MIN_DREL = 30.0         # m: only cap when the lead is farther than this
-PHYS_CAP_TGAP = 1.6              # s: target time-gap to settle at
-PHYS_CAP_MIN_GAP = 20.0          # m: floor on the target gap
-PHYS_CAP_VREL_MARGIN = 1.5       # m/s: treat the lead as closing this much faster (pessimistic -> firmer cap)
-PHYS_CAP_FORGET_T = 1.0          # s: decay of the held worst-case closing (a benign flicker frame cannot relax the cap)
-PHYS_CAP_MIN_A = -0.5            # m/s^2: only cap if the closing lead itself warrants at least this brake
-                                 # (else the brake is for another cause -- curve / vision / a closer lead -- leave it)
-
-GAS_SUPPRESS_ENABLED = False
-GAS_SUPPRESS_DREL = 60.0          # m: lead within this distance
-GAS_SUPPRESS_VREL = 0.5           # m/s: "not pulling away" bound for the rebound trigger (vLead - vEgo)
-GAS_SUPPRESS_CLOSE = -1.5         # m/s: closing rate below which gas is suppressed outright
-GAS_SUPPRESS_RECENT_T = 3.0       # s: a brake within this long counts as recent
-GAS_SUPPRESS_BRAKE_THR = -0.30    # m/s^2: output below this is a "brake" for the recency latch
+# TTC-scaled brake-jerk limiter: cap how fast the brake DEEPENS, scaled by urgency. Roomy (high TTC) -> gentle
+# onset (smooth decel, no jerk); urgent (low TTC) -> fast (no delay on a real emergency). Caps the RATE only,
+# never the magnitude, so it cannot under-brake -- only smooths the onset where there is room. Gated OFF.
+JERK_LIMIT_ENABLED = False
+BRAKE_JERK_SMOOTH = 1.5           # m/s^3: deepening-jerk cap when roomy (TTC >= BRAKE_JERK_TTC_HI)
+BRAKE_JERK_URGENT = 8.0           # m/s^3: deepening-jerk cap when urgent (TTC <= BRAKE_JERK_TTC_LO; ~unconstrained)
+BRAKE_JERK_TTC_HI = 6.0           # s: at/above this TTC -> full smooth limit
+BRAKE_JERK_TTC_LO = 2.5           # s: at/below this TTC -> full fast limit

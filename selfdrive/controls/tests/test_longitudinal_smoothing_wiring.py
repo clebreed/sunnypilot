@@ -43,10 +43,12 @@ def test_dec_model_stop_target_not_reintroduced():
 
 
 def test_long_feature_gates():
-  # comfort_stop OFF: keep the stock smooth taper (flat-hold firms the end); farther-stop comes from the MPC
-  # stop-target shift instead. vLead speed-damp (B) stays OFF pending on-road proof.
-  from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import COMFORT_STOP_ENABLED
-  from openpilot.sunnypilot.selfdrive.controls.lib.radar_distance.radar_distance import VLEAD_DAMP_ENABLED
+  # The surviving opt-in long features all default OFF (byte-stock until enabled + on-road verified):
+  # AccelController jerk-limiter, RadarDistance lead-smoother + stop-gap bias.
+  from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import JERK_LIMIT_ENABLED
+  from openpilot.sunnypilot.selfdrive.controls.lib.radar_distance.radar_distance import \
+    LEAD_SMOOTH_ENABLED, STOP_GAP_BIAS_ENABLED
 
-  assert COMFORT_STOP_ENABLED is False
-  assert VLEAD_DAMP_ENABLED is False
+  assert JERK_LIMIT_ENABLED is False
+  assert LEAD_SMOOTH_ENABLED is False
+  assert STOP_GAP_BIAS_ENABLED is False

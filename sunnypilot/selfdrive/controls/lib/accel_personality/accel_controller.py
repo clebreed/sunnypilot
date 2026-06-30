@@ -4,13 +4,12 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Acceleration personality: per-profile launch/cruise accel ceiling (ECO/NORMAL/SPORT), an anticipatory
-brake front-load, and a low-speed comfort stop. SAFETY: a firm/closing brake -- emergency (raw <=
-HARD_BRAKE_TARGET_ACCEL or brake_need >= HARD_BRAKE_NEED), FCW/crash, should_stop, or blended/e2e -- passes
-the plan straight through at full strength and rate, never softened/delayed/rate-limited. Only on the
-NON-emergency comfort path may the onset arrive spread by at most ONSET_SPREAD_MAX (a tightly bounded,
-transient lag) so a gentle brake does not land as a step. The front-load and comfort stop only ever ADD
-braking (min(., plan)). Disabled => byte-stock.
+Acceleration personality: per-profile launch/cruise accel ceiling (ECO/NORMAL/SPORT), an anticipatory brake
+front-load, and a TTC-scaled brake-jerk limiter (smooth decel). SAFETY: a firm/closing brake -- emergency
+(raw <= HARD_BRAKE_TARGET_ACCEL or brake_need >= HARD_BRAKE_NEED), FCW/crash, should_stop, or blended/e2e --
+passes the plan straight through, never softened. Only on the NON-emergency path may the onset arrive spread
+by at most ONSET_SPREAD_MAX (a bounded transient lag). The front-load only ever ADDS braking (min(., plan)),
+and the jerk limiter caps the deepening RATE only (never the magnitude). Disabled => byte-stock.
 """
 
 from collections.abc import Sequence
@@ -28,12 +27,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants imp
   BRAKE_RELEASE_JERK, ACCEL_RISE_JERK, SMOOTH_DECEL_LOOKAHEAD_T, MIN_SMOOTH_BRAKE_NEED, \
   HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED, OVERBITE_CAP, STOP_PASSTHROUGH_V, \
   STOP_IMMINENT_VEGO, STOP_IMMINENT_LOOKAHEAD_T, ONSET_SPREAD_MAX, ONSET_SPREAD_JERK, \
-  COMFORT_STOP_ENABLED, COMFORT_STOP_V, COMFORT_STOP_LEAD_V, COMFORT_STOP_GAP, \
-  COMFORT_STOP_MAX_DECEL, COMFORT_STOP_RELEASE_V, COMFORT_STOP_HOLD_GAP, \
-  GAS_SUPPRESS_ENABLED, GAS_SUPPRESS_DREL, GAS_SUPPRESS_VREL, GAS_SUPPRESS_CLOSE, \
-  GAS_SUPPRESS_RECENT_T, GAS_SUPPRESS_BRAKE_THR, \
-  PHYSICS_CAP_ENABLED, PHYS_CAP_MIN_TTC, PHYS_CAP_MIN_DREL, PHYS_CAP_TGAP, PHYS_CAP_MIN_GAP, PHYS_CAP_VREL_MARGIN, \
-  PHYS_CAP_FORGET_T, PHYS_CAP_MIN_A
+  JERK_LIMIT_ENABLED, BRAKE_JERK_SMOOTH, BRAKE_JERK_URGENT, BRAKE_JERK_TTC_HI, BRAKE_JERK_TTC_LO
 
 _ZERO_ACCEL_EPS = 1e-6
 
@@ -55,14 +49,7 @@ class AccelController:
     self._lead_status = False
     self._lead_d = 0.0
     self._lead_vlead = 0.0
-    self._stop_floor = 0.0       # comfort-stop floor latch (monotone within a stop episode, eased on release)
-    self._comfort_stop_enabled = COMFORT_STOP_ENABLED
-    self._gas_suppress_enabled = GAS_SUPPRESS_ENABLED
-    self._physics_cap_enabled = PHYSICS_CAP_ENABLED
-    self._cap_vrel = 0.0                                 # held worst-case (most-closing) lead for the physics cap
-    self._cap_dRel = 1e9
-    self._cap_vlead = 0.0
-    self._since_brake_frames = 10 ** 6                   # frames since last brake output (gas-suppress recency)
+    self._jerk_limit_enabled = JERK_LIMIT_ENABLED
     self._read_params()
 
   def _read_params(self) -> None:
@@ -104,8 +91,7 @@ class AccelController:
     self._bypassed = False
 
     out = self._shape(raw, should_stop, reset, speed_trajectory, t_idxs, stock_brake)
-    out = self._comfort_stop(out, reset)   # low-speed monotone comfort decel-to-stop (replaces the self-releasing enforcer)
-    out = self._physics_decel_cap(out, reset)   # don't over-brake a closing lead that has room (brakes < stock)
+    out = self._brake_jerk_limit(out, reset)    # TTC-scaled deepening-jerk cap: smooth onset where there is room
     return self._finalize(out)
 
   def _shape(self, raw: float, should_stop: bool, reset: bool, speed_trajectory, t_idxs, stock_brake: bool) -> float:
@@ -127,7 +113,6 @@ class AccelController:
       target = min(raw, self._decel_target)
       if raw > 0.0:
         target = max(target, 0.0)                              # plan wants throttle -> ease the gas early, never fabricate a brake
-    target = self._suppress_gas_near_lead(target, raw)
     slewed = self._slew(target)
     if raw >= 0.0:
       return slewed
@@ -135,49 +120,21 @@ class AccelController:
       return min(slewed, raw)                                  # blended/e2e: the model owns the brake -> strict never-weaker
     return self._onset_spread(slewed, raw)                     # non-emergency brake: bounded onset spread (<= ONSET_SPREAD_MAX weaker)
 
-  def _physics_decel_cap(self, out: float, reset: bool) -> float:
-    # On a closing lead with genuine room, cap the brake at the kinematic decel needed to settle at a comfortable
-    # gap -- the stock MPC over-brakes a slower lead at speed. Only softens (max(out, a_phys)). Uses a HELD
-    # worst-case closing (decaying ~PHYS_CAP_FORGET_T) so a benign lead-flicker frame cannot relax it, and only
-    # acts when the closing itself warrants a real brake (a_phys <= PHYS_CAP_MIN_A) so it never softens a brake
-    # meant for another cause (curve / vision / a closer lead). Guarded to TTC + distance, pessimistic vRel
-    # margin, self-disengaging as room shrinks (full stock brake returns).
-    if reset or not self._lead_status:
-      self._cap_vrel, self._cap_dRel, self._cap_vlead = 0.0, 1e9, 0.0
-    else:
-      vrel = self._lead_vlead - self._v_ego
-      if vrel < self._cap_vrel:                                # adopt a more-closing lead immediately
-        self._cap_vrel, self._cap_dRel, self._cap_vlead = vrel, self._lead_d, self._lead_vlead
-      else:                                                    # forget an old threat slowly
-        f = DT_MDL / PHYS_CAP_FORGET_T
-        self._cap_vrel += (vrel - self._cap_vrel) * f
-        self._cap_dRel += (self._lead_d - self._cap_dRel) * f
-        self._cap_vlead += (self._lead_vlead - self._cap_vlead) * f
-    if not self._enabled or not self._physics_cap_enabled or out >= 0.0 or not self._lead_status:
-      return out
-    hv, hd, hl = self._cap_vrel, self._cap_dRel, self._cap_vlead
-    if hv >= -0.5 or hd < PHYS_CAP_MIN_DREL or hd / -hv < PHYS_CAP_MIN_TTC:
-      return out
-    room = hd - max(PHYS_CAP_MIN_GAP, PHYS_CAP_TGAP * hl)
-    if room <= 1.0:
-      return out
-    a_phys = -((hv - PHYS_CAP_VREL_MARGIN) ** 2) / (2.0 * room)
-    if a_phys > PHYS_CAP_MIN_A:                                # lead-closing alone does not warrant a real brake
-      return out
-    return max(out, a_phys)                                    # only ever softens; never below the needed decel
+  def _lead_ttc(self) -> float:
+    if not self._lead_status:
+      return 1e3                                                # no lead -> no urgency
+    vrel = self._lead_vlead - self._v_ego
+    if vrel >= -0.1:
+      return 1e3                                                # not closing -> no urgency
+    return self._lead_d / -vrel
 
-  def _suppress_gas_near_lead(self, target: float, raw: float) -> float:
-    # Coast instead of accelerating toward a close lead: T1 recent brake + lead not pulling away, or T2 clearly
-    # closing. Only reduces accel, never a brake. Off => no-op.
-    if not self._gas_suppress_enabled or raw <= 0.0 or not self._lead_status:
-      return target
-    if not 0.1 < self._lead_d < GAS_SUPPRESS_DREL:
-      return target
-    closing = self._lead_vlead - self._v_ego
-    recent_brake = self._since_brake_frames * DT_MDL < GAS_SUPPRESS_RECENT_T
-    if (recent_brake and closing < GAS_SUPPRESS_VREL) or closing < GAS_SUPPRESS_CLOSE:
-      return min(target, 0.0)
-    return target
+  def _brake_jerk_limit(self, out: float, reset: bool) -> float:
+    # Cap how fast the brake DEEPENS, scaled by TTC: roomy -> gentle (smooth onset), urgent -> fast (no delay).
+    # Rate only -- never changes the magnitude, so it can never under-brake; an emergency just ramps quickly.
+    if reset or not self._enabled or not self._jerk_limit_enabled or out >= self._last_target_accel:
+      return out                                                # releasing/steady or off: nothing to limit
+    jmax = float(np.interp(self._lead_ttc(), [BRAKE_JERK_TTC_LO, BRAKE_JERK_TTC_HI], [BRAKE_JERK_URGENT, BRAKE_JERK_SMOOTH]))
+    return max(out, self._last_target_accel - jmax * DT_MDL)
 
   def _onset_spread(self, shaped: float, raw: float) -> float:
     # Scoped softening: on a NON-emergency brake the onset may arrive spread instead of stepping to the plan.
@@ -188,30 +145,6 @@ class AccelController:
     spread = max(raw, self._last_target_accel - ONSET_SPREAD_JERK * DT_MDL)   # deepen toward the plan, jerk-limited
     spread = min(spread, raw + ONSET_SPREAD_MAX)                              # never more than the bounded lag weaker
     return min(shaped, spread)
-
-  def _comfort_stop(self, out: float, reset: bool) -> float:
-    # Low-speed ANTI-CREEP HOLD behind a near-stopped lead. In the final-approach window it HOLDS the deepest
-    # decel the PLAN itself commanded this episode (gentle-capped at COMFORT_STOP_MAX_DECEL), so the brake does
-    # not ease off / creep in before the car is stopped (no roll, slightly roomier). It is NEVER firmer than the
-    # plan -- it only stops the brake from WEAKENING -- so it can never add a hard bite (the old kinematic
-    # enforcer demanded a firm ~-1.6 grab; this does not). Outside the window (gap opening as a creeping lead
-    # pulls away / lead moving / launch / standstill) the floor eases out at the release rate. min(out, floor)
-    # keeps it never weaker than the plan. Off => no-op (off==stock).
-    if reset or not self._enabled or not self._comfort_stop_enabled:
-      self._stop_floor = 0.0                                   # disabled/gated/reset: drop the latch, pure passthrough
-      return out
-    final_approach = (self._lead_status and self._lead_vlead < COMFORT_STOP_LEAD_V and self._lead_d > 0.1
-                      and COMFORT_STOP_RELEASE_V <= self._v_ego < COMFORT_STOP_V
-                      and self._lead_d - COMFORT_STOP_GAP <= COMFORT_STOP_HOLD_GAP)
-    if final_approach:
-      plan_hold = max(out, COMFORT_STOP_MAX_DECEL)             # the plan's own decel, gentle-capped (never firmer)
-      self._stop_floor = min(plan_hold, self._stop_floor)      # latch the deepest -> hold through the plan's ease
-    else:
-      # Not final approach (cruise / gap opening / lead moving / launch / standstill): ease the floor toward 0 at
-      # the release rate. Matches _shape's own _slew_up rate, so the floor decays in lockstep with the natural
-      # output -> no launch drag, no release-direction snap, no phantom brake into an opening gap.
-      self._stop_floor = min(0.0, self._stop_floor + BRAKE_RELEASE_JERK * DT_MDL)
-    return min(out, self._stop_floor) if self._stop_floor < 0.0 else out
 
   def _stop_imminent(self, speed_trajectory: Sequence[float] | None, t_idxs: Sequence[float]) -> bool:
     # plan predicts a near-stop within the lookahead -> a stop is coming (lead or light/sign).
@@ -255,7 +188,6 @@ class AccelController:
   def _finalize(self, target_accel: float) -> float:
     target_accel = self._clean_accel(target_accel)
     self._last_target_accel = target_accel
-    self._since_brake_frames = 0 if target_accel < GAS_SUPPRESS_BRAKE_THR else self._since_brake_frames + 1
     return target_accel
 
   @staticmethod
@@ -283,9 +215,3 @@ class AccelController:
 
   def bypassed(self) -> bool:
     return self._bypassed
-
-  def comfort_stop_floor(self) -> float:
-    return self._stop_floor
-
-  def comfort_stop_active(self) -> bool:
-    return self._stop_floor < 0.0

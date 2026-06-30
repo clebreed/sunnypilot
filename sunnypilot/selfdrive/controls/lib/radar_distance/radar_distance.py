@@ -4,13 +4,12 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-RadarDistance smooths the lead the longitudinal MPC follows on a noisy radar, never reporting a
+RadarDistance conditions the lead the longitudinal MPC follows on a noisy radar, never reporting a
 farther-or-faster lead than reality, so braking is always >= stock:
   - flicker-hold: keep a just-dropped, recently-sustained lead alive through a radar dropout.
-  - speed damp: lag the lead speeding up (instant on slow-down) to damp the catch-up surge / rubber-band,
-    reset on a track switch so it never carries a stale-slow value across a different track.
-Active only above LOW_SPEED_PASSTHROUGH_V; at/below it returns the raw radarstate (byte-stock stops).
-Default off => stock passthrough.
+  - lead-jitter smoother: de-jitter a churning (trackId-flipping) lead so the MPC does not hunt the gap.
+  - stop-gap bias: report a near-stopped lead slightly closer so the MPC stops a touch farther back.
+Also publishes a read-only lead-instability flag (telemetry). Default off => stock passthrough.
 """
 
 from collections import deque
@@ -27,11 +26,7 @@ MIN_HELD_DREL = 0.5
 
 LOW_SPEED_PASSTHROUGH_V = 5.0   # m/s
 
-# Speed-damp (B) gated off (caused phantom braking + launch rubber-band before); flicker-hold (A) runs alone.
-VLEAD_DAMP_ENABLED = False
-VLEAD_TAU = 0.4                 # s, lag on a speeding-up lead
-_VLEAD_ALPHA = DT_MDL / VLEAD_TAU
-SWITCH_DREL = 8.0              # m, dRel jump that means the radar switched to a different track -> reset the filter
+SWITCH_DREL = 8.0              # m, dRel jump = a track switch (used by the instability detector)
 
 # Lead-instability detector (telemetry only): flags a bimodal/bouncing radar lead.
 STABILITY_WINDOW = 5            # frames (~0.25s @ 20Hz)
@@ -57,21 +52,6 @@ STOP_BIAS_VLEAD = 1.5         # m/s: only behind a (near-)stopped lead; ramps ou
 STOP_BIAS_REGIME_DREL = 12.0   # m: bias ramps in below this dRel
 STOP_BIAS_RAMP_BAND = 2.0     # m: ramp-in band (full offset below REGIME_DREL - RAMP_BAND)
 STOP_BIAS_MIN_DREL = 2.0      # m: never report a lead closer than this
-
-
-class _LeadView:
-  __slots__ = ('status', 'dRel', 'yRel', 'vRel', 'vLead', 'vLeadK', 'aLeadK', 'aLeadTau', 'modelProb')
-
-  def __init__(self, src, vlead):
-    self.status = src.status
-    self.dRel = src.dRel
-    self.yRel = src.yRel
-    self.vRel = src.vRel
-    self.vLead = vlead
-    self.vLeadK = vlead
-    self.aLeadK = src.aLeadK
-    self.aLeadTau = src.aLeadTau
-    self.modelProb = src.modelProb
 
 
 class _BiasedLead:
@@ -164,8 +144,6 @@ class _LeadHold:
     self._since_real = 0
     self._armed = False
     self._held_dRel = 0.0
-    self._vlead_f = None
-    self._last_dRel = None
 
   def reset(self):
     self.__init__()
@@ -190,21 +168,6 @@ class _LeadHold:
 
     self._armed = False
     return raw
-
-  def smooth(self, lead):
-    if not lead.status:
-      self._vlead_f = None
-      self._last_dRel = None
-      return lead
-    if self._last_dRel is None or abs(lead.dRel - self._last_dRel) > SWITCH_DREL:
-      self._vlead_f = lead.vLead
-    self._last_dRel = lead.dRel
-    v = float(lead.vLead)
-    if self._vlead_f is None or v <= self._vlead_f:
-      self._vlead_f = v
-      return lead
-    self._vlead_f += (v - self._vlead_f) * _VLEAD_ALPHA
-    return _LeadView(lead, self._vlead_f)
 
 
 class _LeadStability:
@@ -249,7 +212,6 @@ class RadarDistanceController:
     self._frame = 0
     self._v_ego = 0.0
     self._enabled = self._params.get_bool("RadarDistance")
-    self._vlead_damp_enabled = VLEAD_DAMP_ENABLED
     self._stop_gap_bias_enabled = STOP_GAP_BIAS_ENABLED
     self._lead_smooth_enabled = LEAD_SMOOTH_ENABLED
     self._one = _LeadHold()
@@ -302,6 +264,4 @@ class RadarDistanceController:
     one = self._stop_gap_bias(one)
     if self._lead_smooth_enabled:
       one = self._smoother.update(one, self._stability.churn)  # de-jitter a churning lead (anti follow-hunt)
-    if not self._vlead_damp_enabled:
-      return _RadarStateProxy(one, two)                       # flicker-hold (A) only
-    return _RadarStateProxy(self._one.smooth(one), self._two.smooth(two))
+    return _RadarStateProxy(one, two)

@@ -39,12 +39,10 @@ def make_sm(v_ego=20.0, lead_status=False, lead_d=0.0, lead_vlead=0.0):
   return {'carState': SimpleNamespace(vEgo=v_ego), 'radarState': SimpleNamespace(leadOne=lead)}
 
 
-def make_controller(enabled=True, personality=NORMAL, crash_cnt=0, comfort_stop=False, gas_suppress=False, physics_cap=False):
+def make_controller(enabled=True, personality=NORMAL, crash_cnt=0, jerk_limit=False):
   store = {"AccelPersonalityEnabled": enabled, "AccelPersonality": int(personality)}
   ctrl = AccelController(CP=SimpleNamespace(), mpc=SimpleNamespace(crash_cnt=crash_cnt), params=FakeParams(store))
-  ctrl._comfort_stop_enabled = comfort_stop   # comfort_stop is gated off in production; opt in per-test
-  ctrl._gas_suppress_enabled = gas_suppress   # gas-suppression is gated off in production; opt in per-test
-  ctrl._physics_cap_enabled = physics_cap     # physics decel cap is gated off in production; opt in per-test
+  ctrl._jerk_limit_enabled = jerk_limit       # brake-jerk limiter is gated off in production; opt in per-test
   ctrl.update(make_sm())
   return ctrl
 
@@ -232,190 +230,35 @@ def test_stop_imminent_passthrough_but_moving_follow_shapes():
   assert ctrl.smooth_active()
 
 
-def test_comfort_stop_holds_through_plan_ease():
-  # Plan brakes to a peak then eases off near the stop (the stock creep). The hold keeps the deeper decel so
-  # the brake does not ease in (no roll) -- but NEVER firmer than the plan's own peak (no added hard bite).
-  ctrl = make_controller(personality=ECO, comfort_stop=True)
-  out = 0.0
-  for plan in [-0.4, -0.8, -1.1, -1.1, -0.6, -0.3, -0.1]:   # decel to a -1.1 peak, then ease (creep)
-    ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=6.0, lead_vlead=0.0))
-    out = ctrl.smooth_target_accel(plan, flat_traj(plan), T_IDXS, should_stop=False)
-  assert out < -0.3 - _EPS                              # held deeper than the easing plan (-0.1) -> no creep-in
-  assert out >= -1.1 - _EPS                             # but never firmer than the plan's own peak (no -1.6 bite)
+# --- TTC-scaled brake-jerk limiter (smooth decel) ----------------------------
 
-
-def test_comfort_stop_never_firmer_than_plan():
-  # The hold can only stop the brake from WEAKENING; it never commands a decel firmer than the plan itself.
-  ctrl = make_controller(personality=ECO, comfort_stop=True)
-  for plan in [-0.2, -0.5, -0.9, -0.9, -0.9]:           # steady (no ease) -> hold matches plan, adds nothing
-    ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=6.0, lead_vlead=0.0))
-    out = ctrl.smooth_target_accel(plan, flat_traj(plan), T_IDXS, should_stop=False)
-    assert out == pytest.approx(plan, abs=_EPS)         # never firmer than the (non-easing) plan -> no bite/grab
-
-
-def test_comfort_stop_monotone_no_early_release():
-  # While still moving, the comfort floor never WEAKENS frame-to-frame (the old enforcer self-released -> roll).
-  ctrl = make_controller(personality=ECO, comfort_stop=True)
-  floors = []
-  for v in [3.0, 2.6, 2.2, 1.8, 1.4, 1.0, 0.6]:         # decelerating toward the lead
-    ctrl.update(make_sm(v_ego=v, lead_status=True, lead_d=max(0.5, 7.0 - (3.0 - v) * 2), lead_vlead=0.0))
-    ctrl.smooth_target_accel(-0.5, flat_traj(-0.5), T_IDXS, should_stop=False)
-    floors.append(ctrl._stop_floor)
-  for a, b in zip(floors, floors[1:], strict=False):
-    assert b <= a + _EPS                                # monotone non-weakening while approaching
-
-
-def test_comfort_stop_off_when_disabled():
-  ctrl = make_controller(enabled=False, personality=ECO)
-  ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=4.0, lead_vlead=0.0))
-  out = ctrl.smooth_target_accel(-0.1, flat_traj(-0.1), T_IDXS, should_stop=False)
-  assert out == pytest.approx(-0.1, abs=_EPS)
-
-
-def test_comfort_stop_gated_off_is_stock_passthrough():
-  # Production default (COMFORT_STOP_ENABLED off, even with AccelController enabled): the final approach is stock
-  # passthrough -- output follows the easing plan, no anti-creep hold, floor stays 0 (goal 6 met by stock).
-  ctrl = make_controller(personality=ECO)                      # comfort_stop defaults False (production)
-  out = 0.0
-  for plan in [-0.4, -0.8, -1.1, -0.6, -0.1]:                  # decel to a peak then ease (stock creep)
-    ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=6.0, lead_vlead=0.0))
-    out = ctrl.smooth_target_accel(plan, flat_traj(plan), T_IDXS, should_stop=False)
-  assert out == pytest.approx(-0.1, abs=_EPS)                  # follows the easing plan -> no hold
-  assert ctrl._stop_floor == 0.0                               # never latched
-
-
-def test_comfort_stop_no_op_moving_lead():
-  # Moving lead (vLead high): no comfort stop (only behind a near-stopped lead).
-  ctrl = make_controller(personality=ECO, comfort_stop=True)
-  ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=6.0, lead_vlead=5.0))
-  out = ctrl.smooth_target_accel(-0.1, flat_traj(-0.1), T_IDXS, should_stop=False)
-  assert out == pytest.approx(-0.1, abs=_EPS)
-
-
-def test_comfort_stop_never_weaker():
-  # The comfort floor only ever ADDS braking: output never weaker than the plan.
-  ctrl = make_controller(personality=ECO, comfort_stop=True)
-  for raw in (-0.05, -0.3, -1.0, -2.5):
-    ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=5.5, lead_vlead=0.0))
-    out = ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
-    assert out <= raw + _EPS
-
-
-def test_comfort_stop_weakens_when_gap_opens():
-  # Creeping stop-and-go lead (vLead stays < COMFORT_STOP_LEAD_V) that pulls away: once the gap opens well past
-  # the target the floor must WEAKEN, not hold a phantom brake into an opening gap.
-  ctrl = make_controller(personality=ECO, comfort_stop=True)
-  for _ in range(15):                                          # approach close -> deep floor (final-approach hold)
-    ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=5.5, lead_vlead=0.3))
-    ctrl.smooth_target_accel(-0.5, flat_traj(-0.5), T_IDXS, should_stop=False)
-  deep = ctrl._stop_floor
-  assert deep < -0.3
-  for _ in range(25):                                          # lead creeps away (still vLead<1): gap opens wide
-    ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=12.0, lead_vlead=0.5))
-    ctrl.smooth_target_accel(-0.05, flat_traj(-0.05), T_IDXS, should_stop=False)
-  assert ctrl._stop_floor > deep + 0.3                         # floor weakened as the gap opened (no phantom brake)
-
-
-def test_comfort_stop_releases_on_launch():
-  # Stop-and-go GO: after holding a comfort floor at a stop, once the lead moves and the plan wants throttle the
-  # floor must release (track the plan up) and not hold the output below the natural plan -> the car launches.
-  ctrl = make_controller(personality=ECO, comfort_stop=True)
-  for _ in range(20):                                          # hold the plan's -1.0 decel approaching a stopped lead
-    ctrl.update(make_sm(v_ego=1.5, lead_status=True, lead_d=6.0, lead_vlead=0.0))
-    ctrl.smooth_target_accel(-1.0, flat_traj(-1.0), T_IDXS, should_stop=False)
-  assert ctrl._stop_floor < -0.5                               # floor holds the plan's decel (engaged/deep)
-  out = 0.0
-  for _ in range(30):                                          # lead launches, plan wants throttle
-    ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=8.0, lead_vlead=4.0))
-    out = ctrl.smooth_target_accel(0.8, flat_traj(0.8), T_IDXS, should_stop=False)
-  assert out > 0.0                                             # launches (floor did not hold it back)
-  assert ctrl._stop_floor == 0.0                               # floor fully released
-
-
-# --- gas suppression near a non-opening lead ---------------------------------
-
-def _gas(ctrl, v_ego, lead_d, lead_vlead, raw=0.4):
+def _jl(ctrl, v_ego, lead_d, lead_vlead, raw=-2.8):
   ctrl.update(make_sm(v_ego=v_ego, lead_status=True, lead_d=lead_d, lead_vlead=lead_vlead))
   return ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
 
-def _brake_then(ctrl, v_ego, lead_d, lead_vlead, raw):
-  for _ in range(3):                                           # brake for the lead -> set the recency latch
-    ctrl.update(make_sm(v_ego=v_ego, lead_status=True, lead_d=lead_d, lead_vlead=lead_vlead))
-    ctrl.smooth_target_accel(-0.5, flat_traj(-0.5), T_IDXS, should_stop=False)
-  ctrl.update(make_sm(v_ego=v_ego, lead_status=True, lead_d=lead_d, lead_vlead=lead_vlead))
-  return ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
+def test_jerk_limit_smooths_roomy_onset():
+  out = _jl(make_controller(jerk_limit=True), 34.7, 84.0, 23.7)   # TTC 7.6s -> gentle 1.5 m/s^3
+  assert -0.2 < out < 0.0                                         # first frame rate-limited, not slammed to -2.8
 
-def test_gas_suppress_T2_closing_lead_coasts():
-  # T2: clearly gaining on the lead (closing -2.5) -> suppress outright (the 0480 t448 case).
-  ctrl = make_controller(gas_suppress=True)
-  out = _gas(ctrl, v_ego=23.0, lead_d=54.0, lead_vlead=20.5)
-  assert out <= _EPS                                           # coast, never a fabricated brake
-  assert out >= -0.5 - _EPS
+def test_jerk_limit_lets_urgent_through_fast():
+  out = _jl(make_controller(jerk_limit=True), 16.0, 30.0, 0.0)    # vRel -16, TTC 1.9s -> fast 8 m/s^3
+  assert out < -0.3                                               # ramps fast, far firmer than the roomy case
 
-def test_gas_suppress_T1_rebound_after_brake():
-  # T1: braked for a matched lead, then plan wants gas again within RECENT_T -> suppress the rebound (t1302 case).
-  ctrl = make_controller(gas_suppress=True)
-  out = _brake_then(ctrl, v_ego=20.0, lead_d=50.0, lead_vlead=20.0, raw=0.3)
-  assert out <= _EPS
-
-def test_gas_suppress_allows_matched_lead_without_recent_brake():
-  # The deliberate narrowing: a steady matched lead we did NOT just brake for keeps its gas (no normal-following drag).
-  ctrl = make_controller(gas_suppress=True)
-  out = _gas(ctrl, v_ego=20.0, lead_d=50.0, lead_vlead=20.0)   # closing 0, no recent brake
-  assert out > 0.0
-
-def test_gas_suppress_allows_gas_when_lead_opening():
-  ctrl = make_controller(gas_suppress=True)
-  out = _gas(ctrl, v_ego=20.0, lead_d=50.0, lead_vlead=24.0)   # lead pulling away +4 -> keep up (neither trigger)
-  assert out > 0.0
-
-def test_gas_suppress_allows_gas_when_lead_far():
-  ctrl = make_controller(gas_suppress=True)
-  out = _gas(ctrl, v_ego=23.0, lead_d=80.0, lead_vlead=20.5)   # closing -2.5 but beyond GAS_SUPPRESS_DREL -> allow
-  assert out > 0.0
-
-def test_gas_suppress_off_by_default_is_stock_gas():
-  ctrl = make_controller()                                     # gas_suppress defaults False (production)
-  out = _gas(ctrl, v_ego=23.0, lead_d=54.0, lead_vlead=20.5)
-  assert out > 0.0                                             # stock gas passes through
-
-def test_gas_suppress_does_not_touch_brake():
-  ctrl = make_controller(gas_suppress=True)
-  out = _gas(ctrl, v_ego=23.0, lead_d=54.0, lead_vlead=20.5, raw=-0.5)   # plan brakes
-  assert out <= 0.0                                            # suppression no-ops on a brake (never weakens it)
-
-
-# --- physics decel cap (no over-brake on a roomy closing lead) ---------------
-
-def _closing(ctrl, v_ego, lead_d, lead_vlead, raw):
-  ctrl.update(make_sm(v_ego=v_ego, lead_status=True, lead_d=lead_d, lead_vlead=lead_vlead))
-  return ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
-
-def test_physics_cap_softens_roomy_overbrake():
-  # the 0488 t600 case: lead 84m, 23.7 m/s, ego 34.7 (vRel -11, TTC 7.6s). -2.8 over-brakes; physics ~ -1.7.
-  out = _closing(make_controller(physics_cap=True), 34.7, 84.0, 23.7, -2.8)
-  assert -2.1 < out < -1.2
-
-def test_physics_cap_never_touches_close_lead():
-  out = _closing(make_controller(physics_cap=True), 20.0, 18.0, 9.0, -2.8)   # dRel < MIN_DREL
+def test_jerk_limit_off_passthrough():
+  out = _jl(make_controller(), 34.7, 84.0, 23.7)
   assert out == pytest.approx(-2.8, abs=_EPS)
 
-def test_physics_cap_never_touches_low_ttc():
-  out = _closing(make_controller(physics_cap=True), 30.0, 35.0, 5.0, -2.8)   # vRel -25 -> TTC ~1.4s
-  assert out == pytest.approx(-2.8, abs=_EPS)
+def test_jerk_limit_no_lead_gentle():
+  ctrl = make_controller(jerk_limit=True)
+  ctrl.update(make_sm(v_ego=20.0))                               # no lead -> no urgency
+  out = ctrl.smooth_target_accel(-2.8, flat_traj(-2.8), T_IDXS, should_stop=False)
+  assert -0.2 < out < 0.0
 
-def test_physics_cap_off_passthrough():
-  out = _closing(make_controller(), 34.7, 84.0, 23.7, -2.8)                  # default off
-  assert out == pytest.approx(-2.8, abs=_EPS)
-
-def test_physics_cap_only_softens_never_hardens():
-  out = _closing(make_controller(physics_cap=True), 34.7, 84.0, 23.7, -0.5)  # already gentler than physics
-  assert out > -1.5                                                          # cap does not deepen it
-
-def test_physics_cap_skips_brake_not_from_lead():
-  # barely-closing far lead (vRel -1) but a real -1.5 brake (curve/vision/closer lead): a_phys ~ 0 -> don't cap.
-  out = _closing(make_controller(physics_cap=True), 34.0, 100.0, 33.0, -1.5)
-  assert out == pytest.approx(-1.5, abs=_EPS)
+def test_jerk_limit_does_not_limit_release():
+  ctrl = make_controller(jerk_limit=True)
+  ctrl._last_target_accel = -2.0
+  ctrl.update(make_sm(v_ego=20.0, lead_status=True, lead_d=40.0, lead_vlead=18.0))
+  assert ctrl._brake_jerk_limit(-0.5, reset=False) == pytest.approx(-0.5, abs=_EPS)   # releasing -> not limited
 
 
 def test_onset_spread_bounded_and_skipped_for_emergency():
