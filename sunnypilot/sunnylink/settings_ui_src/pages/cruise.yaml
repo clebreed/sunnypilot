@@ -28,7 +28,17 @@ sections:
     widget: toggle
     title: Radar Distance
     description: Holds a lead through brief radar flicker/dropout so sunnypilot does not lose and re-grab
-      it, smoothing the hard/late brakes that radar drop-outs cause. Braking is never reduced below stock.
+      it, and at higher speed keeps a slightly wider following gap so it starts slowing sooner when the
+      lead does. Smooths the hard/late brakes that radar drop-outs cause. Braking is never reduced below stock.
+    visibility:
+    - $ref: '#/macros/longitudinal'
+    enablement:
+    - $ref: '#/macros/longitudinal'
+  - key: StopSettleSoften
+    widget: toggle
+    title: Smooth Stop
+    description: Eases the brake pressure as the car settles the last few mph to a stop, so it stops with
+      a soft taper instead of a firm catch. Only affects the final crawl, not normal braking.
     visibility:
     - $ref: '#/macros/longitudinal'
     enablement:

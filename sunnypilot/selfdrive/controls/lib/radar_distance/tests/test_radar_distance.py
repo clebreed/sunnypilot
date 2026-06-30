@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from openpilot.sunnypilot.selfdrive.controls.lib.radar_distance.radar_distance import \
-  RadarDistanceController, HOLD_MAX_FRAMES, FCW_PROB_CAP, LOW_SPEED_PASSTHROUGH_V
+  RadarDistanceController, HOLD_MAX_FRAMES, FCW_PROB_CAP, LOW_SPEED_PASSTHROUGH_V, \
+  SPEED_GAP_MAX_M, SPEED_GAP_MIN_DREL
 
 COMFORT_BRAKE = 2.5
 
@@ -38,7 +39,7 @@ def obstacle(ld):
 
 def ctrl(enabled=True):
   c = RadarDistanceController(CP=SimpleNamespace(), params=FakeParams({'RadarDistance': enabled}))
-  c._v_ego = LOW_SPEED_PASSTHROUGH_V + 10.0  # default above the gate so hold-logic tests exercise the flicker-hold
+  c._v_ego = 10.0  # above the low-speed gate (hold logic runs) but below the speed-gap onset (it stays inert here)
   return c
 
 
@@ -224,6 +225,48 @@ def test_stop_bias_far_lead_no_change():
 def test_stop_bias_via_smooth_radarstate_low_speed():
   out = _biased_ctrl().smooth_radarstate(rs(lead(dRel=8.0, vLead=0.0, vRel=-2.0)))
   assert out.leadOne.dRel < 8.0                                # biased proxy returned at low speed
+
+
+# --- speed-gap bias (wider gap at speed) -------------------------------------
+
+def _speed_ctrl(v_ego=20.0):
+  c = ctrl()                                                   # speed-gap rides on the controller being enabled
+  c._v_ego = v_ego
+  return c
+
+def test_speed_gap_reports_closer_at_speed():
+  out = _speed_ctrl(v_ego=20.0)._speed_gap_bias(lead(dRel=60.0))
+  assert out.dRel < 60.0                                        # reported closer => MPC keeps a wider real gap
+  assert out.status and out.vLead == 18.0                       # other fields preserved
+
+def test_speed_gap_monotone_never_farther():
+  c = _speed_ctrl(v_ego=25.0)
+  for dr in (10.0, 30.0, 60.0, 100.0):
+    assert c._speed_gap_bias(lead(dRel=dr)).dRel <= dr + 1e-6   # only ever closer (brake >= stock)
+
+def test_speed_gap_offset_capped():
+  out = _speed_ctrl(v_ego=40.0)._speed_gap_bias(lead(dRel=120.0))
+  assert out.dRel >= 120.0 - SPEED_GAP_MAX_M - 1e-6             # reduction never exceeds the cap
+
+def test_speed_gap_min_floor():
+  out = _speed_ctrl(v_ego=30.0)._speed_gap_bias(lead(dRel=4.0))
+  assert out.dRel >= SPEED_GAP_MIN_DREL - 1e-6                  # close cut-in not reported past the floor
+
+def test_speed_gap_off_when_controller_disabled():
+  c = ctrl(enabled=False)
+  c._v_ego = 20.0
+  r = rs(lead(dRel=60.0))
+  assert c.smooth_radarstate(r) is r                            # controller off -> no speed-gap, byte-stock
+
+def test_speed_gap_low_speed_no_change():
+  ld = lead(dRel=20.0)
+  assert _speed_ctrl(v_ego=7.0)._speed_gap_bias(ld) is ld       # below the bottom speed bp -> no offset (no step)
+
+def test_speed_gap_via_smooth_radarstate_keeps_obstacle_le():
+  c = _speed_ctrl(v_ego=22.0)
+  one = lead(dRel=70.0, vLead=20.0)
+  out = c.smooth_radarstate(rs(one))
+  assert obstacle(out.leadOne) <= obstacle(one) + 1e-6          # biased obstacle never farther (brake >= stock)
 
 
 def test_obstacle_monotone_during_hold():

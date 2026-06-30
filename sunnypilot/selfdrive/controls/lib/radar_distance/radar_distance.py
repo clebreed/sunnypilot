@@ -9,10 +9,14 @@ farther-or-faster lead than reality, so braking is always >= stock:
   - flicker-hold: keep a just-dropped, recently-sustained lead alive through a radar dropout.
   - lead-jitter smoother: de-jitter a churning (trackId-flipping) lead so the MPC does not hunt the gap.
   - stop-gap bias: report a near-stopped lead slightly closer so the MPC stops a touch farther back.
+  - speed-gap bias: at higher speed report the lead slightly nearer so the MPC settles a wider following
+    gap and reacts to a lead's deceleration sooner.
 Also publishes a read-only lead-instability flag (telemetry). Default off => stock passthrough.
 """
 
 from collections import deque
+
+import numpy as np
 
 from opendbc.car import structs
 from openpilot.common.params import Params
@@ -52,6 +56,14 @@ STOP_BIAS_VLEAD = 1.5         # m/s: only behind a (near-)stopped lead; ramps ou
 STOP_BIAS_REGIME_DREL = 12.0   # m: bias ramps in below this dRel
 STOP_BIAS_RAMP_BAND = 2.0     # m: ramp-in band (full offset below REGIME_DREL - RAMP_BAND)
 STOP_BIAS_MIN_DREL = 2.0      # m: never report a lead closer than this
+
+# Speed-gap bias: widen the following gap at higher speed by reporting the lead a touch nearer
+# (offset_m = dt(v) * v_ego). The MPC regulates the reported gap onto its target, so the real gap settles
+# wider and braking onto a slowing lead starts sooner. Only reports nearer, so braking stays >= stock.
+SPEED_GAP_V_BP = [14.0, 28.0]          # m/s: gap widening ramps in across this band, flat above
+SPEED_GAP_TF_V = [0.0, 0.25]           # s: follow-time added to the gap at the band ends
+SPEED_GAP_MAX_M = 5.0                  # m: cap on the reported reduction
+SPEED_GAP_MIN_DREL = 3.0               # m: never report the lead nearer than this
 
 
 class _BiasedLead:
@@ -252,6 +264,17 @@ class RadarDistanceController:
       return lead
     return _BiasedLead(lead, max(lead.dRel - offset, STOP_BIAS_MIN_DREL))
 
+  def _speed_gap_bias(self, lead):
+    # Report the lead nearer at speed so the MPC holds a wider gap and brakes sooner onto a slowing lead.
+    if not lead.status:
+      return lead
+    tf = float(np.interp(self._v_ego, SPEED_GAP_V_BP, SPEED_GAP_TF_V))
+    offset = min(tf * self._v_ego, SPEED_GAP_MAX_M)
+    new_dRel = max(lead.dRel - offset, SPEED_GAP_MIN_DREL)
+    if new_dRel >= lead.dRel - 0.05:
+      return lead
+    return _BiasedLead(lead, new_dRel)
+
   def smooth_radarstate(self, radarstate):
     self._stability.update(radarstate.leadOne, self._v_ego)   # telemetry, runs every cycle
     if not self._enabled:
@@ -262,6 +285,7 @@ class RadarDistanceController:
       one_b = self._stop_gap_bias(radarstate.leadOne)         # low speed = stock lead, only the stop-gap bias
       return radarstate if one_b is radarstate.leadOne else _RadarStateProxy(one_b, radarstate.leadTwo)
     one = self._stop_gap_bias(one)
+    one = self._speed_gap_bias(one)
     if self._lead_smooth_enabled:
       one = self._smoother.update(one, self._stability.churn)  # de-jitter a churning lead (anti follow-hunt)
     return _RadarStateProxy(one, two)
