@@ -246,6 +246,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // Stop Gap Bias: stop a bit farther back from a stopped lead so it doesn't crawl in too close
     {"StopGapBias", {PERSISTENT | BACKUP, BOOL, "0"}},
 
+    // Lead Decel Anticipate: start braking earlier for a hard-braking lead so the brake isn't a late catch-up
+    {"LeadDecelAnticipate", {PERSISTENT | BACKUP, BOOL, "0"}},
+
     // sunnypilot model params
     {"CameraOffset", {PERSISTENT | BACKUP, FLOAT, "0.0"}},
     {"LagdToggle", {PERSISTENT | BACKUP, BOOL, "1"}},

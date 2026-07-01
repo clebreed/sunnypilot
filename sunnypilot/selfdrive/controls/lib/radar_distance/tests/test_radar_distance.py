@@ -11,7 +11,7 @@ import pytest
 
 from openpilot.sunnypilot.selfdrive.controls.lib.radar_distance.radar_distance import \
   RadarDistanceController, HOLD_MAX_FRAMES, FCW_PROB_CAP, LOW_SPEED_PASSTHROUGH_V, \
-  SPEED_GAP_MAX_M, SPEED_GAP_MIN_DREL
+  SPEED_GAP_MAX_M, SPEED_GAP_MIN_DREL, LEAD_DECEL_MIN_DREL, LEAD_DECEL_OFFSET_V
 
 COMFORT_BRAKE = 2.5
 
@@ -274,6 +274,55 @@ def test_speed_gap_via_smooth_radarstate_keeps_obstacle_le():
   one = lead(dRel=70.0, vLead=20.0)
   out = c.smooth_radarstate(rs(one))
   assert obstacle(out.leadOne) <= obstacle(one) + 1e-6          # biased obstacle never farther (brake >= stock)
+
+
+# --- lead-decel anticipation (brake earlier for a braking, closing lead) ------
+
+def _decel_ctrl(v_ego=12.0):
+  c = ctrl()
+  c._lead_decel_enabled = True
+  c._v_ego = v_ego
+  return c
+
+def test_lead_decel_reports_nearer_when_braking_and_closing():
+  out = _decel_ctrl()._lead_decel_bias(lead(dRel=30.0, vRel=-3.0, aLeadK=-2.0))
+  assert out.dRel < 30.0                                       # nearer => MPC brakes earlier
+  assert out.vLead == 18.0 and out.status                      # other fields preserved
+
+def test_lead_decel_offset_scales_with_brake():
+  c = _decel_ctrl()
+  soft = c._lead_decel_bias(lead(dRel=40.0, vRel=-3.0, aLeadK=-1.0)).dRel
+  hard = c._lead_decel_bias(lead(dRel=40.0, vRel=-3.0, aLeadK=-3.0)).dRel
+  assert hard < soft                                           # harder lead brake => more anticipation
+  assert 40.0 - hard <= max(LEAD_DECEL_OFFSET_V) + 1e-6        # capped
+
+def test_lead_decel_noop_when_not_braking():
+  ld = lead(dRel=30.0, vRel=-3.0, aLeadK=0.0)
+  assert _decel_ctrl()._lead_decel_bias(ld) is ld              # lead not braking -> no anticipation
+
+def test_lead_decel_noop_when_not_closing():
+  ld = lead(dRel=30.0, vRel=0.5, aLeadK=-2.0)
+  assert _decel_ctrl()._lead_decel_bias(ld) is ld              # not closing -> no anticipation
+
+def test_lead_decel_monotone_never_farther():
+  c = _decel_ctrl()
+  for dr in (6.0, 15.0, 40.0):
+    assert c._lead_decel_bias(lead(dRel=dr, vRel=-3.0, aLeadK=-2.5)).dRel <= dr + 1e-6
+
+def test_lead_decel_min_floor():
+  out = _decel_ctrl()._lead_decel_bias(lead(dRel=5.0, vRel=-3.0, aLeadK=-3.0))
+  assert out.dRel >= LEAD_DECEL_MIN_DREL - 1e-6
+
+def test_lead_decel_off_no_change():
+  ld = lead(dRel=30.0, vRel=-3.0, aLeadK=-2.0)
+  assert ctrl()._lead_decel_bias(ld) is ld                     # param off -> passthrough
+
+def test_lead_decel_independent_of_radar_distance():
+  c = ctrl(enabled=False)
+  c._lead_decel_enabled = True
+  c._v_ego = 12.0
+  out = c.smooth_radarstate(rs(lead(dRel=30.0, vRel=-3.0, aLeadK=-2.0)))
+  assert out.leadOne.dRel < 30.0                               # anticipation works standalone
 
 
 def test_obstacle_monotone_during_hold():

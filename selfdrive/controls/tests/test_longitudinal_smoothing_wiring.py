@@ -14,6 +14,7 @@ def test_smoothing_params_default_off():
   assert re.search(r'"AccelPersonalityEnabled", \{PERSISTENT \| BACKUP, BOOL, "0"\}', params_keys)
   assert re.search(r'"RadarDistance", \{PERSISTENT \| BACKUP, BOOL, "0"\}', params_keys)
   assert re.search(r'"StopGapBias", \{PERSISTENT \| BACKUP, BOOL, "0"\}', params_keys)
+  assert re.search(r'"LeadDecelAnticipate", \{PERSISTENT \| BACKUP, BOOL, "0"\}', params_keys)
 
 
 def test_longitudinal_smoothing_stays_planner_side():

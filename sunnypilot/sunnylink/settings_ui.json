@@ -634,6 +634,26 @@
               ]
             },
             {
+              "key": "LeadDecelAnticipate",
+              "widget": "toggle",
+              "title": "Anticipate Braking Lead",
+              "description": "When the lead brakes hard, starts slowing earlier and spreads the brake instead of a late hard catch-up. Braking is never reduced below stock.",
+              "visibility": [
+                {
+                  "type": "capability",
+                  "field": "has_longitudinal_control",
+                  "equals": true
+                }
+              ],
+              "enablement": [
+                {
+                  "type": "capability",
+                  "field": "has_longitudinal_control",
+                  "equals": true
+                }
+              ]
+            },
+            {
               "key": "DisengageOnAccelerator",
               "widget": "toggle",
               "title": "Disengage Cruise on Accelerator Pedal",

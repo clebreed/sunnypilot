@@ -65,6 +65,15 @@ SPEED_GAP_TF_V = [0.0, 0.25]           # s: follow-time added to the gap at the 
 SPEED_GAP_MAX_M = 5.0                  # m: cap on the reported reduction
 SPEED_GAP_MIN_DREL = 3.0               # m: never report the lead nearer than this
 
+# Lead-decel anticipation: when the lead is braking (aLeadK negative) and we are closing, report it a bit
+# nearer so the MPC brings its brake forward and spreads it, rather than a late hard catch-up. The offset
+# grows with how hard the lead is braking. Only reports nearer (obstacle only shrinks => brake >= stock).
+# Gated by the LeadDecelAnticipate param.
+LEAD_DECEL_ALEAD_BP = [0.5, 3.0]       # |aLeadK| m/s^2 (lead braking) mapped to the anticipation offset
+LEAD_DECEL_OFFSET_V = [0.0, 5.0]       # m: dRel reduction across that band
+LEAD_DECEL_MAX_VREL = -0.3             # m/s: only anticipate when closing (vRel below this)
+LEAD_DECEL_MIN_DREL = 4.0              # m: never report the lead nearer than this
+
 
 class _BiasedLead:
   __slots__ = ('status', 'dRel', 'yRel', 'vRel', 'vLead', 'vLeadK', 'aLeadK', 'aLeadTau', 'modelProb')
@@ -225,6 +234,7 @@ class RadarDistanceController:
     self._v_ego = 0.0
     self._enabled = self._params.get_bool("RadarDistance")
     self._stop_gap_bias_enabled = self._params.get_bool("StopGapBias")
+    self._lead_decel_enabled = self._params.get_bool("LeadDecelAnticipate")
     self._lead_smooth_enabled = LEAD_SMOOTH_ENABLED
     self._one = _LeadHold()
     self._two = _LeadHold()
@@ -238,6 +248,7 @@ class RadarDistanceController:
       self._two.reset()
     self._enabled = enabled
     self._stop_gap_bias_enabled = self._params.get_bool("StopGapBias")
+    self._lead_decel_enabled = self._params.get_bool("LeadDecelAnticipate")
 
   def update(self, sm) -> None:
     if self._frame % int(1. / DT_MDL) == 0:
@@ -276,18 +287,31 @@ class RadarDistanceController:
       return lead
     return _BiasedLead(lead, new_dRel)
 
+  def _lead_decel_bias(self, lead):
+    # Report a braking, closing lead a bit nearer so the MPC brakes earlier and spreads it (anticipation).
+    if not self._lead_decel_enabled or not lead.status:
+      return lead
+    if lead.aLeadK >= 0.0 or lead.vRel > LEAD_DECEL_MAX_VREL:
+      return lead
+    offset = float(np.interp(-lead.aLeadK, LEAD_DECEL_ALEAD_BP, LEAD_DECEL_OFFSET_V))
+    new_dRel = max(lead.dRel - offset, LEAD_DECEL_MIN_DREL)
+    if new_dRel >= lead.dRel - 0.05:
+      return lead
+    return _BiasedLead(lead, new_dRel)
+
   def smooth_radarstate(self, radarstate):
     self._stability.update(radarstate.leadOne, self._v_ego)   # telemetry, runs every cycle
     if not self._enabled:
-      one_b = self._stop_gap_bias(radarstate.leadOne)          # stop-gap bias works standalone; else passthrough
+      one_b = self._lead_decel_bias(self._stop_gap_bias(radarstate.leadOne))  # standalone biases (self-gated)
       return radarstate if one_b is radarstate.leadOne else _RadarStateProxy(one_b, radarstate.leadTwo)
     one = self._one.step(radarstate.leadOne)
     two = self._two.step(radarstate.leadTwo)
     if self._v_ego < LOW_SPEED_PASSTHROUGH_V:
-      one_b = self._stop_gap_bias(radarstate.leadOne)         # low speed = stock lead, only the stop-gap bias
+      one_b = self._lead_decel_bias(self._stop_gap_bias(radarstate.leadOne))  # crawl: stop-gap + anticipation
       return radarstate if one_b is radarstate.leadOne else _RadarStateProxy(one_b, radarstate.leadTwo)
     one = self._stop_gap_bias(one)
     one = self._speed_gap_bias(one)
+    one = self._lead_decel_bias(one)
     if self._lead_smooth_enabled:
       one = self._smoother.update(one, self._stability.churn)  # de-jitter a churning lead (anti follow-hunt)
     return _RadarStateProxy(one, two)
