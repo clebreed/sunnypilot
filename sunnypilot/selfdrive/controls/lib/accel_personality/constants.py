@@ -58,6 +58,25 @@ JERK_SCALE_V = {
   SPORT:  [0.30, 1.0],
 }
 
+# --- Onset jerk-cost relaxation (MPC INPUT: general accel<->decel-direction change, not just launch) ------
+# The v_ego-indexed table above only relaxes near a stop. This relaxes on ANY fresh accel<->decel direction
+# change (aEgo crossing the deadband in a new sign) regardless of speed: drop to a tier-scaled floor right
+# away, then ease linearly back to 1.0 (stock) over ONSET_RAMP_S. Same shape as the launch ramp, general to
+# any onset (e.g. releasing off a lead, starting to brake). Disabled -> 1.0.
+ONSET_DEADBAND = 0.15          # m/s^2: ignore aEgo noise this small around a zero-crossing
+ONSET_RAMP_S = 0.4             # s: ease back to stock over this long
+ONSET_FLOOR = {ECO: 0.75, NORMAL: 0.65, SPORT: 0.50}
+
+# --- Lead-braking jerk-cost relaxation (MPC INPUT: react faster to a hard-braking lead) --------------------
+# When the tracked lead is itself decelerating hard, relax jerk cost so the MPC's reaction isn't paced by a
+# jerk budget tuned for routine following. No lead, or lead not braking -> 1.0. Disabled -> 1.0.
+LEAD_BRAKE_ALEAD_BP = [-3.0, -0.5]      # m/s^2, lead's own aLeadK (ascending, as np.interp requires)
+LEAD_BRAKE_FACTOR_V = {
+  ECO:    [0.75, 1.0],
+  NORMAL: [0.60, 1.0],
+  SPORT:  [0.45, 1.0],
+}
+
 # --- Follow-gap widen (add-only, fed to the MPC t_follow) ------------------------------------------------
 # Add a small speed-dependent widen to the stock t_follow (the driver's gap-button value). Wider gap ->
 # MPC brakes earlier + gentler onto a slowing lead and settles a roomier cruise gap. Invariants:

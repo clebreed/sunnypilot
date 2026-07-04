@@ -19,8 +19,9 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.accel_controller import AccelController
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   ECO, NORMAL, SPORT, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, RISE_RATE_V, \
-  STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, JERK_SCALE_BP, JERK_SCALE_V, TF_WIDEN_V_BP, TF_WIDEN_BASE_V, \
-  TF_WIDEN_TIER, TF_WIDEN_MAX, TF_SLEW_PER_S, TF_DECEL_HOLD_A, AccelerationPersonality
+  STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, JERK_SCALE_BP, JERK_SCALE_V, ONSET_DEADBAND, ONSET_RAMP_S, \
+  ONSET_FLOOR, LEAD_BRAKE_ALEAD_BP, LEAD_BRAKE_FACTOR_V, TF_WIDEN_V_BP, TF_WIDEN_BASE_V, TF_WIDEN_TIER, \
+  TF_WIDEN_MAX, TF_SLEW_PER_S, TF_DECEL_HOLD_A, AccelerationPersonality
 
 _EPS = 1e-6
 _TF_STOCK = 1.45          # a representative stock t_follow (standard personality); the widen is add-only on top
@@ -41,8 +42,13 @@ class FakeParams:
     self.store[key] = val
 
 
-def make_sm(v_ego=20.0, a_ego=0.0):
-  return {'carState': SimpleNamespace(vEgo=v_ego, aEgo=a_ego)}
+def make_lead(status=False, aLeadK=0.0):
+  return SimpleNamespace(status=status, aLeadK=aLeadK)
+
+
+def make_sm(v_ego=20.0, a_ego=0.0, lead=None):
+  return {'carState': SimpleNamespace(vEgo=v_ego, aEgo=a_ego),
+          'radarState': SimpleNamespace(leadOne=lead or make_lead())}
 
 
 def make_controller(enabled=True, personality=NORMAL):
@@ -176,6 +182,114 @@ def test_jerk_scale_table_matches_constants():
     ctrl = make_controller(personality=personality)
     for v in (0.0, 2.0, 5.0, 15.0):
       assert ctrl.get_jerk_scale(v) == pytest.approx(np.interp(v, JERK_SCALE_BP, JERK_SCALE_V[personality]))
+
+
+# --- onset relax: fresh accel<->decel direction change, any speed ------------------------------------------
+
+def test_onset_disabled_is_stock():
+  ctrl = make_controller(enabled=False, personality=SPORT)
+  ctrl.update(make_sm(v_ego=20.0, a_ego=2.0))
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)
+
+
+def test_onset_no_effect_at_steady_state():
+  ctrl = make_controller(personality=NORMAL)
+  for _ in range(10):
+    ctrl.update(make_sm(v_ego=20.0, a_ego=0.0))
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)   # within the deadband, no direction to flip from
+
+
+def test_onset_drops_to_floor_on_fresh_direction_change():
+  ctrl = make_controller(personality=NORMAL)
+  ctrl.update(make_sm(v_ego=20.0, a_ego=1.0))    # establish "accelerating"
+  ctrl.update(make_sm(v_ego=20.0, a_ego=-1.0))   # fresh flip to decelerating
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(ONSET_FLOOR[NORMAL])
+
+
+def test_onset_eases_back_to_stock_over_ramp_s():
+  ctrl = make_controller(personality=NORMAL)
+  ctrl.update(make_sm(v_ego=20.0, a_ego=1.0))
+  ctrl.update(make_sm(v_ego=20.0, a_ego=-1.0))
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(ONSET_FLOOR[NORMAL])
+  n = int(ONSET_RAMP_S / DT_MDL)
+  for _ in range(n):
+    ctrl.update(make_sm(v_ego=20.0, a_ego=-1.0))   # sustained decel, no further flip
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_onset_never_relaxes_below_its_own_floor():
+  ctrl = make_controller(personality=SPORT)
+  ctrl.update(make_sm(v_ego=20.0, a_ego=1.0))
+  for _ in range(50):
+    ctrl.update(make_sm(v_ego=20.0, a_ego=-1.0 if _ % 2 == 0 else -1.2))   # repeated same-direction wiggle
+  assert ctrl.get_jerk_scale(20.0) >= ONSET_FLOOR[SPORT] - _EPS
+
+
+def test_onset_tier_ordering():
+  ordered = []
+  for personality in (ECO, NORMAL, SPORT):
+    ctrl = make_controller(personality=personality)
+    ctrl.update(make_sm(v_ego=20.0, a_ego=1.0))
+    ctrl.update(make_sm(v_ego=20.0, a_ego=-1.0))
+    ordered.append(ctrl.get_jerk_scale(20.0))
+  assert ordered[2] < ordered[1] < ordered[0]   # SPORT relaxes most, ECO least
+
+
+def test_onset_ignores_deadband_noise():
+  ctrl = make_controller(personality=NORMAL)
+  ctrl.update(make_sm(v_ego=20.0, a_ego=0.3))
+  for _ in range(10):
+    ctrl.update(make_sm(v_ego=20.0, a_ego=ONSET_DEADBAND - 0.02))   # tiny wiggle, never crosses -deadband
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0, abs=1e-3)
+
+
+# --- lead-braking relax: hard-braking lead relaxes jerk cost regardless of speed ---------------------------
+
+def test_lead_brake_no_lead_is_stock():
+  ctrl = make_controller(personality=SPORT)
+  ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=False, aLeadK=-5.0)))
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)
+
+
+def test_lead_brake_relaxes_with_lead_decel():
+  for personality, floor in ((ECO, 0.75), (NORMAL, 0.60), (SPORT, 0.45)):
+    ctrl = make_controller(personality=personality)
+    ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, aLeadK=-3.0)))
+    assert ctrl.get_jerk_scale(20.0) == pytest.approx(floor)
+
+
+def test_lead_brake_gentle_lead_decel_is_stock():
+  ctrl = make_controller(personality=SPORT)
+  ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, aLeadK=-0.2)))
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)   # above the -0.5 gate -> no relax
+
+
+def test_lead_brake_matches_constants_table():
+  for personality in (ECO, NORMAL, SPORT):
+    ctrl = make_controller(personality=personality)
+    for a_lead in (-0.5, -1.5, -3.0):
+      ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, aLeadK=a_lead)))
+      expected = np.interp(a_lead, LEAD_BRAKE_ALEAD_BP, LEAD_BRAKE_FACTOR_V[personality])
+      assert ctrl.get_jerk_scale(20.0) == pytest.approx(expected)
+
+
+# --- combined: get_jerk_scale takes the most-relaxed of all three factors ----------------------------------
+
+def test_combined_takes_most_relaxed_factor():
+  ctrl = make_controller(personality=NORMAL)
+  ctrl.update(make_sm(v_ego=20.0, a_ego=1.0))
+  # onset flip (floor=0.65) + hard-braking lead (floor=0.60 at aLeadK=-3.0) -> min of the two, near-stop is 1.0 at v=20
+  ctrl.update(make_sm(v_ego=20.0, a_ego=-1.0, lead=make_lead(status=True, aLeadK=-3.0)))
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(min(ONSET_FLOOR[NORMAL], LEAD_BRAKE_FACTOR_V[NORMAL][0]))
+
+
+def test_reset_clears_onset_and_lead_brake_state():
+  ctrl = make_controller(personality=SPORT)
+  ctrl.update(make_sm(v_ego=20.0, a_ego=1.0))
+  ctrl.update(make_sm(v_ego=20.0, a_ego=-1.0, lead=make_lead(status=True, aLeadK=-3.0)))
+  assert ctrl.get_jerk_scale(20.0) < 1.0 - _EPS
+  ctrl.reset()
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)
 
 
 # --- t_follow: add-only speed widen -----------------------------------------------------------------------

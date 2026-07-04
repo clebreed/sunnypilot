@@ -7,6 +7,8 @@ See the LICENSE.md file in the root directory for more details.
 Acceleration Personality (ECO / NORMAL / SPORT). Tunes only MPC INPUTS, never the output:
   * positive-accel ceiling + speed-dependent per-cycle open-rate -> tier-scaled take-off from a stop
     (the open-rate is fast near v=0 so launch is never delayed, tapering to a steady-state rate at speed);
+  * jerk-cost relaxation (scales the core MPC's jerk_factor) -> smooth accel/decel onset: near a stop, on
+    any fresh accel<->decel direction change, and when the tracked lead is itself braking hard;
   * add-only, speed-dependent follow-gap widen on the MPC t_follow -> earlier/gentler braking, roomier gap;
   * sticky should_stop hysteresis -> no stop-and-go gas-brake-gas-brake.
 Add-only gap => desired distance >= stock => braking >= stock. Disabled => stock everywhere (byte-stock).
@@ -21,8 +23,36 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   NORMAL, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, A_CRUISE_MAX_V, STOCK_A_CRUISE_MAX_V, \
-  RISE_RATE_BP, RISE_RATE_V, STOCK_RISE_RATE, JERK_SCALE_BP, JERK_SCALE_V, TF_WIDEN_V_BP, TF_WIDEN_BASE_V, \
-  TF_WIDEN_TIER, TF_WIDEN_MAX, TF_SLEW_PER_S, TF_DECEL_HOLD_A
+  RISE_RATE_BP, RISE_RATE_V, STOCK_RISE_RATE, JERK_SCALE_BP, JERK_SCALE_V, ONSET_DEADBAND, ONSET_RAMP_S, \
+  ONSET_FLOOR, LEAD_BRAKE_ALEAD_BP, LEAD_BRAKE_FACTOR_V, TF_WIDEN_V_BP, TF_WIDEN_BASE_V, TF_WIDEN_TIER, \
+  TF_WIDEN_MAX, TF_SLEW_PER_S, TF_DECEL_HOLD_A
+
+
+class _OnsetRelax:
+  # Detects a fresh accel<->decel direction change on aEgo (a real, causal signal -- never the MPC's own
+  # solved target) and relaxes toward a tier-scaled floor immediately, then eases linearly back to 1.0 over
+  # ONSET_RAMP_S. Feeds the MPC's cost weights for the cycles that follow; never touches this cycle's output.
+  def __init__(self):
+    self._prev_sign = 0
+    self._ramp = 1.0
+
+  def reset(self) -> None:
+    self._prev_sign = 0
+    self._ramp = 1.0
+
+  def update(self, a_ego: float, floor: float) -> float:
+    sign = 0
+    if a_ego > ONSET_DEADBAND:
+      sign = 1
+    elif a_ego < -ONSET_DEADBAND:
+      sign = -1
+
+    if sign != 0 and sign != self._prev_sign:
+      self._ramp = floor
+      self._prev_sign = sign
+    else:
+      self._ramp = min(1.0, self._ramp + (1.0 - floor) * (DT_MDL / ONSET_RAMP_S))
+    return self._ramp
 
 
 class AccelController:
@@ -36,6 +66,9 @@ class AccelController:
     self._a_ego = 0.0
     self._widen = 0.0                     # current slewed follow-gap widen (s), add-only
     self._t_follow = 0.0                  # last t_follow handed to the MPC (telemetry)
+    self._onset_relax = _OnsetRelax()
+    self._onset_factor = 1.0
+    self._lead_brake_factor = 1.0
     self._read_params()
 
   def _read_params(self) -> None:
@@ -50,11 +83,28 @@ class AccelController:
       self._read_params()
     self._v_ego = float(sm['carState'].vEgo)
     self._a_ego = float(sm['carState'].aEgo)
+
+    if self._enabled:
+      self._onset_factor = self._onset_relax.update(self._a_ego, ONSET_FLOOR[self._personality])
+      self._lead_brake_factor = self._get_lead_brake_factor(sm['radarState'].leadOne)
+    else:
+      self._onset_relax.reset()
+      self._onset_factor = 1.0
+      self._lead_brake_factor = 1.0
+
     self._frame += 1
+
+  def _get_lead_brake_factor(self, lead) -> float:
+    if not lead.status:
+      return 1.0
+    return float(np.interp(lead.aLeadK, LEAD_BRAKE_ALEAD_BP, LEAD_BRAKE_FACTOR_V[self._personality]))
 
   def reset(self) -> None:
     # Drop the accumulated widen (e.g. on disengage / standstill re-init) so it re-ramps cleanly.
     self._widen = 0.0
+    self._onset_relax.reset()
+    self._onset_factor = 1.0
+    self._lead_brake_factor = 1.0
 
   def get_max_accel(self, v_ego: float) -> float:
     # Disabled -> stock ceiling (off == stock, independent of the NORMAL profile so NORMAL is free to differ).
@@ -69,11 +119,13 @@ class AccelController:
     return float(np.interp(v_ego, RISE_RATE_BP, RISE_RATE_V[self._personality]))
 
   def get_jerk_scale(self, v_ego: float) -> float:
-    # Disabled -> 1.0 -> byte-stock jerk cost. Enabled: relaxes the core MPC's jerk_factor near a stop
-    # (tier-scaled), ramping back to 1.0 (stock) by the v=5 knot so cruise/follow jerk is unchanged.
+    # Disabled -> 1.0 -> byte-stock jerk cost. Enabled: takes the most-relaxed of three tier-scaled factors
+    # -- near a stop (v_ego), a fresh accel<->decel onset (any speed), and a hard-braking lead -- each never
+    # exceeding 1.0 (stock), so this only ever relaxes jerk cost, never tightens it beyond stock.
     if not self._enabled:
       return 1.0
-    return float(np.interp(v_ego, JERK_SCALE_BP, JERK_SCALE_V[self._personality]))
+    near_stop = float(np.interp(v_ego, JERK_SCALE_BP, JERK_SCALE_V[self._personality]))
+    return min(near_stop, self._onset_factor, self._lead_brake_factor)
 
   def get_t_follow(self, t_follow: float, v_ego: float) -> float:
     # MPC t_follow hook. Adds a slewed, decel-held, speed-dependent comfort widen on top of the stock
