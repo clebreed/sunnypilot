@@ -66,13 +66,15 @@ class ModeTransitionManager:
     self._pending_mode: ModeType = 'acc'
     self._pending_count = 0
     self._blended_hold_frames = 0
+    self.frames_since_switch = WMACConstants.TRANSITION_SMOOTH_FRAMES
+    self.last_switch_was_immediate = False
 
   def request_mode(self, mode: ModeType, immediate: bool = False, hold_frames: int = 0, cancel_hold: bool = False) -> None:
     if immediate:
       self._blended_hold_frames = max(self._blended_hold_frames, hold_frames)
       self._pending_mode = mode
       self._pending_count = 0
-      self._switch_mode(mode)
+      self._switch_mode(mode, immediate=True)
       return
 
     if cancel_hold and mode == 'acc':
@@ -97,17 +99,18 @@ class ModeTransitionManager:
 
     required_count = WMACConstants.ENTER_BLENDED_FRAMES if mode == 'blended' else WMACConstants.EXIT_BLENDED_FRAMES
     if self._pending_count >= required_count:
-      self._switch_mode(mode)
+      self._switch_mode(mode, immediate=False)
 
   def update(self) -> None:
     if self._blended_hold_frames > 0:
       self._blended_hold_frames -= 1
     self.mode_duration += 1
+    self.frames_since_switch += 1
 
   def get_mode(self) -> ModeType:
     return self.current_mode
 
-  def _switch_mode(self, mode: ModeType) -> None:
+  def _switch_mode(self, mode: ModeType, immediate: bool) -> None:
     if mode == self.current_mode:
       return
 
@@ -115,6 +118,8 @@ class ModeTransitionManager:
     self.mode_duration = 0
     self._pending_mode = mode
     self._pending_count = 0
+    self.frames_since_switch = 0
+    self.last_switch_was_immediate = immediate
 
 
 class DynamicExperimentalController:
@@ -182,6 +187,15 @@ class DynamicExperimentalController:
 
   def active(self) -> bool:
     return self._active
+
+  def smoothing_transition(self) -> bool:
+    # True for a short window right after switching into blended for a ROUTINE (non-urgent) reason -- the
+    # e2e model's own action.desiredAcceleration may have sat meaningfully negative while acc-only mode
+    # ignored it, so the instant of the switch can otherwise read as a same-cycle discontinuous brake.
+    # Never true for an emergency/FCW-triggered (immediate) switch -- those must never be smoothed/delayed.
+    mgr = self._mode_manager
+    return (mgr.current_mode == 'blended' and not mgr.last_switch_was_immediate and
+            mgr.frames_since_switch < WMACConstants.TRANSITION_SMOOTH_FRAMES)
 
   def set_mpc_fcw_crash_cnt(self) -> None:
     self._mpc_fcw_crash_cnt = self._mpc.crash_cnt

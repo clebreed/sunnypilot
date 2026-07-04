@@ -10,6 +10,7 @@ class WMACConstants:
   ENTER_BLENDED_FRAMES = max(1, int(round(0.4 / DT_MDL)))
   EXIT_BLENDED_FRAMES = max(1, int(round(0.35 / DT_MDL)))
   STANDSTILL_FRAMES = max(1, int(round(0.2 / DT_MDL)))
+  TRANSITION_SMOOTH_FRAMES = max(1, int(round(0.5 / DT_MDL)))
 
   LEAD_PROB = 0.45
   LEAD_EXIT_PROB = 0.25

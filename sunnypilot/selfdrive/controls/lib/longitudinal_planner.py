@@ -22,6 +22,30 @@ from openpilot.sunnypilot.models.helpers import get_active_bundle
 DecState = custom.LongitudinalPlanSP.DynamicExperimentalControl.DynamicExperimentalControlState
 LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
 
+# Bounds how fast output_a_target may drop in the short window right after DEC switches into blended mode
+# for a routine (non-urgent) reason. Never active during an emergency/FCW-triggered switch (dec.smoothing_
+# transition() is false then) -- see DynamicExperimentalController.smoothing_transition().
+TRANSITION_MAX_DROP_PER_CYCLE = 0.15   # m/s^2 per cycle
+
+
+class _E2ETransitionGuard:
+  # Without this, the e2e model's own action.desiredAcceleration -- which may have sat meaningfully negative
+  # for a while, hidden because acc-only mode was ignoring it -- becomes binding the instant DEC switches to
+  # blended, producing a same-cycle discontinuous brake. Only ever limits a DOWNWARD move; never delays a rise.
+  def __init__(self):
+    self._last = None
+
+  def reset(self) -> None:
+    self._last = None
+
+  def apply(self, output_a_target: float, smoothing_active: bool) -> float:
+    if not smoothing_active or self._last is None:
+      self._last = output_a_target
+      return output_a_target
+    limited = max(output_a_target, self._last - TRANSITION_MAX_DROP_PER_CYCLE)
+    self._last = limited
+    return limited
+
 
 class LongitudinalPlannerSP:
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, mpc):
@@ -39,6 +63,7 @@ class LongitudinalPlannerSP:
 
     self.output_v_target = 0.
     self.output_a_target = 0.
+    self._e2e_transition_guard = _E2ETransitionGuard()
 
   def is_e2e(self, sm: messaging.SubMaster) -> bool:
     experimental_mode = sm['selfdriveState'].experimentalMode
@@ -86,6 +111,9 @@ class LongitudinalPlannerSP:
 
   def smooth_radarstate(self, radarstate):
     return self.radar_distance.smooth_radarstate(radarstate)
+
+  def smooth_e2e_transition(self, output_a_target: float) -> float:
+    return self._e2e_transition_guard.apply(output_a_target, self.dec.smoothing_transition())
 
   def publish_longitudinal_plan_sp(self, sm: messaging.SubMaster, pm: messaging.PubMaster) -> None:
     plan_sp_send = messaging.new_message('longitudinalPlanSP')

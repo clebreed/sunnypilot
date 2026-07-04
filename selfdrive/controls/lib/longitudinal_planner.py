@@ -120,6 +120,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       # Clip aEgo to cruise limits to prevent large accelerations when becoming active
       self.a_desired = np.clip(sm['carState'].aEgo, accel_clip[0], accel_clip[1])
       self.accel.reset()  # drop any accumulated follow-gap widen so it re-ramps cleanly on re-engage
+      self._e2e_transition_guard.reset()  # drop the tracked baseline so it doesn't apply a stale limit on re-engage
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
@@ -171,6 +172,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     else:
       output_a_target = output_a_target_mpc
       self.output_should_stop = output_should_stop_mpc
+
+    output_a_target = self.smooth_e2e_transition(output_a_target)
 
     # Acceleration Personality shapes only MPC INPUTS (accel ceiling above + t_follow via mpc.t_follow_fn),
     # never the output accel -- output_a_target passes through byte-stock so the MPC owns the trajectory.

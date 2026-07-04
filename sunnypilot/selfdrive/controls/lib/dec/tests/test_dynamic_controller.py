@@ -1,6 +1,7 @@
 import pytest
 
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController, HysteresisSignal
+from openpilot.sunnypilot.selfdrive.controls.lib.dec.constants import WMACConstants
 
 
 class MockLeadOne:
@@ -96,6 +97,43 @@ def test_emergency_blended_on_fcw(mock_cp, mock_mpc, default_sm):
   mock_mpc.crash_cnt = 1
   controller.update(default_sm)
   assert controller.mode() == "blended"
+
+
+def test_smoothing_transition_false_while_never_switched(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  controller.update(default_sm)
+  assert controller.mode() == "acc"
+  assert not controller.smoothing_transition()
+
+
+def test_smoothing_transition_true_right_after_routine_switch_then_lapses(mock_cp, mock_mpc, default_sm):
+  # a standstill-driven switch is routine (not FCW/immediate) -- smoothing must engage exactly at the switch
+  # and lapse again after WMACConstants.TRANSITION_SMOOTH_FRAMES, staying in blended the whole time.
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+  default_sm['carState'].standstill = True
+  saw_switch_with_smoothing = False
+  prev_mode = controller.mode()
+  for _ in range(20):
+    controller.update(default_sm)
+    if controller.mode() == "blended" and prev_mode == "acc":
+      saw_switch_with_smoothing = controller.smoothing_transition()
+      break
+    prev_mode = controller.mode()
+  assert saw_switch_with_smoothing
+  for _ in range(WMACConstants.TRANSITION_SMOOTH_FRAMES + 2):
+    controller.update(default_sm)
+  assert controller.mode() == "blended"
+  assert not controller.smoothing_transition()   # lapsed after the window, still in blended
+
+
+def test_smoothing_transition_false_for_emergency_switch(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+  mock_mpc.crash_cnt = 1
+  controller.update(default_sm)
+  assert controller.mode() == "blended"
+  assert not controller.smoothing_transition()   # immediate/emergency switch must never be smoothed
 
 
 def test_radarless_slowdown_triggers_blended(mock_cp, mock_mpc, default_sm):
