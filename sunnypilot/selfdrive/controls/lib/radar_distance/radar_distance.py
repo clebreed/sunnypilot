@@ -5,11 +5,17 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
 RadarDistance conditions the lead the longitudinal MPC follows on a noisy (TSS2-class) radar. It NEVER
-reports a farther-or-faster lead than reality, so braking is always >= stock. Three mechanisms:
+reports a farther-or-faster lead than reality, so braking is always >= stock. Four mechanisms:
+  * jump-guard: reject a same-cycle FARTHER dRel jump on a lead that never dropped status (a vision/radar
+    fusion transient during lead acquisition -- e.g. a cut-in whose vision distance estimate briefly
+    disagrees with a solid radar track) by holding the last-trusted, closer reading instead of snapping back
+    out. A closer jump of any size always passes immediately -- this only ever delays relief, never a brake;
   * flicker-hold: keep a just-dropped, recently-sustained lead alive (dead-reckoned) through a brief radar
     dropout so the MPC does not lose and re-grab it (which reads as a phantom release then a catch-up brake);
-  * churn smoother: a short SYMMETRIC EMA on a trackId-churning lead's dRel/vLead/vRel so the MPC stops
-    hunting the gap (removes the follow-jitter that reads as rubber-banding);
+  * churn smoother: a short EMA on a trackId-churning lead's dRel/vLead/vRel so the MPC stops hunting the gap
+    (removes the follow-jitter that reads as rubber-banding). dRel is asymmetric -- closer accepted
+    immediately, only farther is EMA-lagged -- so it can't hold a steadily-closing lead farther-than-true;
+    vLead/vRel stay symmetric (secondary terms, no demonstrated need to bias them);
   * stop-gap: near a (near-)stopped lead at low speed report dRel a touch closer so the MPC's own smooth stop
     settles farther back (the Prius TSS2 stock crawl creeps in to ~1.5 m). Monotone (closer => brake >= stock).
 Also publishes a read-only lead-instability flag (telemetry). Disabled => byte-stock passthrough always.
@@ -31,7 +37,12 @@ LOW_SPEED_PASSTHROUGH_V = 5.0   # m/s: below this, no flicker-hold (holding a st
                                 # delay the launch); the churn smoother still runs down to CREEP_PASSTHROUGH_V
 CREEP_PASSTHROUGH_V = 1.0       # m/s: below this, full byte-stock passthrough (protect the stock stop distance)
 
-SWITCH_DREL = 8.0              # m, dRel jump = a track switch (used by the instability detector)
+SWITCH_DREL = 8.0              # m, dRel jump = a track switch (used by the instability detector + jump-guard)
+
+# Jump-guard: a same-cycle dRel jump this far FARTHER, on a lead that never dropped status, is treated as a
+# fusion transient (not a real sudden separation) and held at the last-trusted value for a bounded number of
+# frames. Self-heals fast so a genuinely-departing lead is never held stale for long.
+JUMP_GUARD_MAX_HOLD = 10       # frames (~0.5s)
 
 # Lead-instability detector (telemetry only): flags a bimodal/bouncing radar lead.
 STABILITY_WINDOW = 5           # frames (~0.25s @ 20Hz)
@@ -111,8 +122,12 @@ class _RadarStateProxy:
 
 
 class _LeadSmoother:
-  # Short symmetric EMA on a churning lead's dRel/vLead/vRel (jitter removal). A hold keeps it active through
-  # brief churn gaps (churn toggles); passthrough + reset only after the hold lapses.
+  # EMA on a churning lead's dRel/vLead/vRel (jitter removal). A hold keeps it active through brief churn
+  # gaps (churn toggles); passthrough + reset only after the hold lapses. dRel is ASYMMETRIC: a closer raw
+  # reading is accepted immediately (never delay awareness of closer -- the file's own invariant), only a
+  # FARTHER raw reading is EMA-lagged (reject noise in that direction). Without this, a lead that's genuinely
+  # closing steadily while churn is (even briefly) active gets held farther-than-true for the full
+  # LEAD_SMOOTH_HOLD window, then snaps -- a false-relief-then-correction that itself becomes a hard brake.
   def __init__(self):
     self._d = None
     self._vl = None
@@ -134,10 +149,41 @@ class _LeadSmoother:
       self._d, self._vl, self._vr = lead.dRel, lead.vLead, lead.vRel
       return lead
     a = DT_MDL / LEAD_SMOOTH_TAU
-    self._d += (lead.dRel - self._d) * a
+    self._d = lead.dRel if lead.dRel < self._d else self._d + (lead.dRel - self._d) * a
     self._vl += (lead.vLead - self._vl) * a
     self._vr += (lead.vRel - self._vr) * a
     return _SmoothedLead(lead, self._d, self._vl, self._vr)
+
+
+class _JumpGuard:
+  # Rejects a same-cycle FARTHER dRel jump on a lead that never dropped status (a vision/radar fusion
+  # transient, e.g. a cut-in whose vision distance estimate briefly disagrees with a solid radar track before
+  # the match locks on) by holding the last-trusted reading, extrapolated by its own vRel, for a bounded
+  # number of frames. A CLOSER jump of any size always passes through immediately -- this can only ever delay
+  # relief, never a brake -- and it self-heals after JUMP_GUARD_MAX_HOLD frames if the jump was real.
+  def __init__(self):
+    self._last = None
+    self._hold = 0
+
+  def reset(self):
+    self._last = None
+    self._hold = 0
+
+  def step(self, raw):
+    if not raw.status:
+      self.reset()
+      return raw
+
+    if self._last is not None and (raw.dRel - self._last[0]) > SWITCH_DREL and self._hold < JUMP_GUARD_MAX_HOLD:
+      dRel0, vRel0, vLead0, aLeadK0, aLeadTau0, prob0 = self._last
+      self._hold += 1
+      held_dRel = max(MIN_HELD_DREL, dRel0 - max(-vRel0, 0.0) * DT_MDL)
+      self._last = (held_dRel, vRel0, vLead0, aLeadK0, aLeadTau0, prob0)
+      return _HeldLead(held_dRel, vRel0, vLead0, aLeadK0, aLeadTau0, prob0)
+
+    self._hold = 0
+    self._last = (raw.dRel, raw.vRel, raw.vLead, raw.aLeadK, raw.aLeadTau, raw.modelProb)
+    return raw
 
 
 class _LeadHold:
@@ -215,6 +261,7 @@ class RadarDistanceController:
     self._frame = 0
     self._v_ego = 0.0
     self._enabled = self._params.get_bool("RadarDistance")
+    self._jump_guard = _JumpGuard()
     self._one = _LeadHold()
     self._two = _LeadHold()
     self._stability = _LeadStability()
@@ -223,6 +270,7 @@ class RadarDistanceController:
   def _read_params(self) -> None:
     enabled = self._params.get_bool("RadarDistance")
     if not enabled and self._enabled:
+      self._jump_guard.reset()
       self._one.reset()
       self._two.reset()
       self._smoother.reset()
@@ -258,7 +306,8 @@ class RadarDistanceController:
       return radarstate                                       # off: byte-stock passthrough
     two = radarstate.leadTwo
     if self._v_ego >= LOW_SPEED_PASSTHROUGH_V:
-      one = self._one.step(radarstate.leadOne)                # flicker-hold ...
+      one = self._jump_guard.step(radarstate.leadOne)         # reject a same-cycle farther-jump transient ...
+      one = self._one.step(one)                               # ... + flicker-hold ...
       two = self._two.step(radarstate.leadTwo)
       one = self._smoother.update(one, self._stability.churn) # ... + churn de-jitter (anti follow-hunt)
     elif self._v_ego >= CREEP_PASSTHROUGH_V:
