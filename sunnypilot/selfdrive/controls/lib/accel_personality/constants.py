@@ -15,7 +15,6 @@ from cereal import custom
 AccelerationPersonality = custom.LongitudinalPlanSP.AccelerationPersonality
 ECO = AccelerationPersonality.eco
 NORMAL = AccelerationPersonality.normal
-SPORT = AccelerationPersonality.sport
 
 PERSONALITY_MIN = min(AccelerationPersonality.schema.enumerants.values())
 PERSONALITY_MAX = max(AccelerationPersonality.schema.enumerants.values())
@@ -51,11 +50,18 @@ RISE_RATE_V = {
 # upstream get_jerk_factor(personality) -- stock 1.0 for relaxed/standard, 0.5 for aggressive. JERK_SCALE
 # multiplies into that same upstream factor (same lever stock's aggressive tier already uses), bounded to
 # near a stop and ramped back to 1.0 (stock) by cruise speed.
+# The v=0 knot is NOT monotone with personality -- verified via a closed-loop MPC harness (dead stop +
+# departing lead, 3 scenarios): 0.60/0.45 both measurably beat stock 1.0 (0.3-0.65s faster to cross the
+# should_stop 0.1 m/s^2 gate, 0 solver resets), but pushing lower is NOT "more relaxed = faster" -- 0.30 came
+# back SLOWER than stock in all 3 scenarios (the MPC back-loads the ramp instead of front-loading it once
+# A_CHANGE_COST/J_EGO_COST get too cheap to bother avoiding), and below ~0.15 the solver itself destabilizes
+# (46-68% QP resets). SPORT's knot is pinned to the verified-good value (tied with NORMAL) rather than pushed
+# lower for tier-consistency -- lower is not safe or effective here, unlike every other tier table in this file.
 JERK_SCALE_BP = [0., 5.]                           # m/s
 JERK_SCALE_V = {
   ECO:    [0.60, 1.0],
   NORMAL: [0.45, 1.0],
-  SPORT:  [0.30, 1.0],
+  SPORT:  [0.45, 1.0],
 }
 
 # --- Onset jerk-cost relaxation (MPC INPUT: general accel<->decel-direction change, not just launch) ------

@@ -155,7 +155,7 @@ def test_jerk_scale_disabled_is_stock():
 
 
 def test_jerk_scale_relaxed_near_stop_flat_at_speed():
-  for personality, relaxed in ((ECO, 0.60), (NORMAL, 0.45), (SPORT, 0.30)):
+  for personality, relaxed in ((ECO, 0.60), (NORMAL, 0.45), (SPORT, 0.45)):
     ctrl = make_controller(personality=personality)
     assert ctrl.get_jerk_scale(0.0) == pytest.approx(relaxed)
     assert ctrl.get_jerk_scale(5.0) == pytest.approx(1.0)      # back to stock by the v=5 knot
@@ -171,10 +171,15 @@ def test_jerk_scale_never_exceeds_stock():
 
 
 def test_jerk_scale_tier_ordering_at_stop():
+  # NOT a strict SPORT<NORMAL<ECO ordering here (unlike every other tier table in this file) -- verified via
+  # a closed-loop MPC harness that pushing the v=0 knot lower than ~0.45 is counterproductive (the MPC
+  # back-loads the ramp instead of front-loading it), so SPORT is pinned to NORMAL's value instead of being
+  # pushed lower for tier-consistency. See the JERK_SCALE_V comment in constants.py.
   eco = make_controller(personality=ECO).get_jerk_scale(0.0)
   nrm = make_controller(personality=NORMAL).get_jerk_scale(0.0)
   spt = make_controller(personality=SPORT).get_jerk_scale(0.0)
-  assert spt < nrm < eco    # SPORT relaxes the most (most responsive launch), ECO the least
+  assert spt == pytest.approx(nrm)
+  assert nrm < eco
 
 
 def test_jerk_scale_table_matches_constants():
@@ -182,6 +187,15 @@ def test_jerk_scale_table_matches_constants():
     ctrl = make_controller(personality=personality)
     for v in (0.0, 2.0, 5.0, 15.0):
       assert ctrl.get_jerk_scale(v) == pytest.approx(np.interp(v, JERK_SCALE_BP, JERK_SCALE_V[personality]))
+
+
+def test_jerk_scale_v0_knot_stays_out_of_the_counterproductive_zone():
+  # Regression guard for the verified finding: pushing the v=0 knot below ~0.45 stops helping and starts
+  # hurting (measured via a closed-loop MPC harness -- 0.30 came back slower than stock in every scenario
+  # tested, and below ~0.15 the solver itself destabilizes). No tier's launch floor should regress into that
+  # zone even if someone re-tunes ECO/NORMAL/SPORT independently later.
+  for personality in (ECO, NORMAL, SPORT):
+    assert JERK_SCALE_V[personality][0] >= 0.40
 
 
 # --- onset relax: fresh accel<->decel direction change, any speed ------------------------------------------
