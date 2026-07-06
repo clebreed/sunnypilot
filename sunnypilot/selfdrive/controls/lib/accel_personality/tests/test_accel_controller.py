@@ -20,8 +20,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.accel_control
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   ECO, NORMAL, SPORT, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, RISE_RATE_V, \
   STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, JERK_SCALE_BP, JERK_SCALE_V, ONSET_DEADBAND, ONSET_RAMP_S, \
-  ONSET_FLOOR, LEAD_BRAKE_ALEAD_BP, LEAD_BRAKE_FACTOR_V, TF_WIDEN_V_BP, TF_WIDEN_BASE_V, TF_WIDEN_TIER, \
-  TF_WIDEN_MAX, TF_SLEW_PER_S, TF_DECEL_HOLD_A, AccelerationPersonality
+  ONSET_FLOOR, LEAD_BRAKE_ALEAD_BP, LEAD_BRAKE_FACTOR_V, CLOSING_VREL_BP, CLOSING_FACTOR_V, TF_WIDEN_V_BP, \
+  TF_WIDEN_BASE_V, TF_WIDEN_TIER, TF_WIDEN_MAX, TF_SLEW_PER_S, TF_DECEL_HOLD_A, AccelerationPersonality
 
 _EPS = 1e-6
 _TF_STOCK = 1.45          # a representative stock t_follow (standard personality); the widen is add-only on top
@@ -42,8 +42,8 @@ class FakeParams:
     self.store[key] = val
 
 
-def make_lead(status=False, aLeadK=0.0):
-  return SimpleNamespace(status=status, aLeadK=aLeadK)
+def make_lead(status=False, aLeadK=0.0, vRel=0.0):
+  return SimpleNamespace(status=status, aLeadK=aLeadK, vRel=vRel)
 
 
 def make_sm(v_ego=20.0, a_ego=0.0, lead=None):
@@ -287,6 +287,56 @@ def test_lead_brake_matches_constants_table():
       assert ctrl.get_jerk_scale(20.0) == pytest.approx(expected)
 
 
+# --- closing-rate relax: fast-closing gap relaxes jerk cost proactively, any cause -------------------------
+
+def test_closing_no_lead_is_stock():
+  ctrl = make_controller(personality=SPORT)
+  ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=False, vRel=-8.0)))
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)
+
+
+def test_closing_relaxes_with_fast_closing_lead():
+  for personality, floor in ((ECO, 0.75), (NORMAL, 0.60), (SPORT, 0.45)):
+    ctrl = make_controller(personality=personality)
+    ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, vRel=-6.0)))
+    assert ctrl.get_jerk_scale(20.0) == pytest.approx(floor)
+
+
+def test_closing_slow_closing_is_stock():
+  ctrl = make_controller(personality=SPORT)
+  ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, vRel=-0.5)))
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)   # above the -1.5 gate -> no relax
+
+
+def test_closing_opening_gap_is_stock():
+  ctrl = make_controller(personality=SPORT)
+  ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, vRel=3.0)))   # lead pulling away
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)
+
+
+def test_closing_matches_constants_table():
+  for personality in (ECO, NORMAL, SPORT):
+    ctrl = make_controller(personality=personality)
+    for v_rel in (-1.5, -3.0, -6.0):
+      ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, vRel=v_rel)))
+      expected = np.interp(v_rel, CLOSING_VREL_BP, CLOSING_FACTOR_V[personality])
+      assert ctrl.get_jerk_scale(20.0) == pytest.approx(expected)
+
+
+def test_closing_disabled_is_stock():
+  ctrl = make_controller(enabled=False, personality=SPORT)
+  ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, vRel=-6.0)))
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)
+
+
+def test_closing_fires_before_a_ego_moves():
+  # The whole point: on the VERY FIRST cycle a fast-closing lead appears, before a_ego has had any chance to
+  # react (still 0.0, so onset-relax is untouched) -- the closing factor alone must already be relaxed.
+  ctrl = make_controller(personality=NORMAL)
+  ctrl.update(make_sm(v_ego=20.0, a_ego=0.0, lead=make_lead(status=True, vRel=-6.0)))
+  assert ctrl.get_jerk_scale(20.0) == pytest.approx(CLOSING_FACTOR_V[NORMAL][0])
+
+
 # --- combined: get_jerk_scale takes the most-relaxed of all three factors ----------------------------------
 
 def test_combined_takes_most_relaxed_factor():
@@ -300,7 +350,7 @@ def test_combined_takes_most_relaxed_factor():
 def test_reset_clears_onset_and_lead_brake_state():
   ctrl = make_controller(personality=SPORT)
   ctrl.update(make_sm(v_ego=20.0, a_ego=1.0))
-  ctrl.update(make_sm(v_ego=20.0, a_ego=-1.0, lead=make_lead(status=True, aLeadK=-3.0)))
+  ctrl.update(make_sm(v_ego=20.0, a_ego=-1.0, lead=make_lead(status=True, aLeadK=-3.0, vRel=-6.0)))
   assert ctrl.get_jerk_scale(20.0) < 1.0 - _EPS
   ctrl.reset()
   assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)

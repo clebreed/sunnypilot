@@ -464,3 +464,39 @@ def test_stability_runs_even_when_disabled():
   for i in range(10):
     c.smooth_radarstate(rs(lead(dRel=40.0, vLead=18.0 if i % 2 else 10.0)))
   assert c.lead_unstable()                           # telemetry not gated by the RadarDistance param
+
+
+# --- same-track noise smoother (bimodal vLead / repeated dRel jump on a CONSTANT radarTrackId) -------------
+
+def test_smoother_dejitters_bimodal_vlead_on_same_track():
+  # Same physical object (radarTrackId constant) but a bouncing velocity read (Doppler/fusion noise) -- the
+  # id evidence pins this to ONE real lead, so it's safe to EMA (unlike a bimodal read with a changing id).
+  c = ctrl()
+  out = None
+  for i in range(30):
+    out = c.smooth_radarstate(rs(lead(dRel=40.0, vLead=18.0 if i % 2 else 10.0, vRel=-1.0, radarTrackId=9)))
+  assert c.lead_unstable()
+  assert 10.0 < out.leadOne.vLead < 18.0             # EMA settled between the two bouncing readings
+  assert out.leadOne.vLead not in (10.0, 18.0)
+
+
+def test_smoother_inactive_on_bimodal_vlead_with_changing_track():
+  # Same bimodal vLead signature, but radarTrackId ALSO changes -- ambiguous (could be two really-different
+  # real objects at different speeds), so this must NOT be smoothed, unlike the same-track case above.
+  c = ctrl()
+  one = lead(dRel=40.0, vLead=18.0, radarTrackId=1)
+  for i in range(10):
+    c.smooth_radarstate(rs(lead(dRel=40.0, vLead=18.0 if i % 2 else 10.0, radarTrackId=1 if i % 2 else 2)))
+  out = c.smooth_radarstate(rs(one))
+  assert out.leadOne is one                          # exact passthrough -- not averaged across tracks
+
+
+def test_smoother_same_track_noise_ignores_drel_jump():
+  # dRel track-jumps are excluded from same_track_noise on purpose: while status stays True, a repeated
+  # farther jump this large is already absorbed by _JumpGuard upstream, so the smoother never even sees the
+  # raw alternation here -- confirms the two mechanisms don't double up on the same signal.
+  c = ctrl()
+  out = None
+  for i in range(30):
+    out = c.smooth_radarstate(rs(lead(dRel=40.0 if i % 2 == 0 else 55.0, vLead=18.0, vRel=-1.0, radarTrackId=4)))
+  assert out.leadOne.dRel < 45.0                     # held near the trusted value by the jump-guard, not 55

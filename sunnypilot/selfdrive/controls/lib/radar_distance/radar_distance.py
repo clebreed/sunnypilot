@@ -12,10 +12,15 @@ reports a farther-or-faster lead than reality, so braking is always >= stock. Fo
     out. A closer jump of any size always passes immediately -- this only ever delays relief, never a brake;
   * flicker-hold: keep a just-dropped, recently-sustained lead alive (dead-reckoned) through a brief radar
     dropout so the MPC does not lose and re-grab it (which reads as a phantom release then a catch-up brake);
-  * churn smoother: a short EMA on a trackId-churning lead's dRel/vLead/vRel so the MPC stops hunting the gap
-    (removes the follow-jitter that reads as rubber-banding). dRel is asymmetric -- closer accepted
-    immediately, only farther is EMA-lagged -- so it can't hold a steadily-closing lead farther-than-true;
-    vLead/vRel stay symmetric (secondary terms, no demonstrated need to bias them);
+  * churn/noise smoother: a short EMA on a lead's dRel/vLead/vRel so the MPC stops hunting the gap (removes
+    the follow-jitter that reads as rubber-banding and, on the sensor side, as a lead-detection "lurch").
+    Covers two DISTINCT same-physical-object noise signatures: trackId churn (id flips frame-to-frame but the
+    kinematics stay coherent -- one real lead getting re-labeled) and same-track noise (id stays constant but
+    vLead itself is bimodal/bouncing -- one real lead with a noisy fusion/Doppler velocity read). Both are
+    safe to EMA because the id evidence pins them to a SINGLE physical object; a bimodal vLead WITH the id
+    also changing is left alone (ambiguous -- could be two really-different real objects) so this can never
+    average two real tracks together. dRel is asymmetric -- closer accepted immediately, only farther is
+    EMA-lagged -- so it can't hold a steadily-closing lead farther-than-true; vLead/vRel stay symmetric;
   * stop-gap: near a (near-)stopped lead at low speed report dRel a touch closer so the MPC's own smooth stop
     settles farther back (the Prius TSS2 stock crawl creeps in to ~1.5 m). Monotone (closer => brake >= stock).
     Overridden off by sustained lead motion (even slow creep) so it can't suppress a real, growing gap during
@@ -134,12 +139,13 @@ class _RadarStateProxy:
 
 
 class _LeadSmoother:
-  # EMA on a churning lead's dRel/vLead/vRel (jitter removal). A hold keeps it active through brief churn
-  # gaps (churn toggles); passthrough + reset only after the hold lapses. dRel is ASYMMETRIC: a closer raw
-  # reading is accepted immediately (never delay awareness of closer -- the file's own invariant), only a
-  # FARTHER raw reading is EMA-lagged (reject noise in that direction). Without this, a lead that's genuinely
-  # closing steadily while churn is (even briefly) active gets held farther-than-true for the full
-  # LEAD_SMOOTH_HOLD window, then snaps -- a false-relief-then-correction that itself becomes a hard brake.
+  # EMA on a noisy same-physical-object lead's dRel/vLead/vRel (jitter removal; see _LeadStability for what
+  # qualifies as "same object"). A hold keeps it active through brief noise gaps (the trigger toggles on/off);
+  # passthrough + reset only after the hold lapses. dRel is ASYMMETRIC: a closer raw reading is accepted
+  # immediately (never delay awareness of closer -- the file's own invariant), only a FARTHER raw reading is
+  # EMA-lagged (reject noise in that direction). Without this, a lead that's genuinely closing steadily while
+  # noisy (even briefly) gets held farther-than-true for the full LEAD_SMOOTH_HOLD window, then snaps -- a
+  # false-relief-then-correction that itself becomes a hard brake.
   def __init__(self):
     self._d = None
     self._vl = None
@@ -152,8 +158,8 @@ class _LeadSmoother:
     self._vr = None
     self._hold = 0
 
-  def update(self, lead, churn: bool):
-    self._hold = LEAD_SMOOTH_HOLD if churn else self._hold - 1
+  def update(self, lead, noisy: bool):
+    self._hold = LEAD_SMOOTH_HOLD if noisy else self._hold - 1
     if self._hold <= 0 or not lead.status:
       self.reset()
       return lead
@@ -234,12 +240,21 @@ class _LeadHold:
 class _LeadStability:
   # Read-only monitor: flags an unstable leadOne -- bimodal/bouncing vLead, dRel track-switch jumps, or
   # radarTrackId churn (a steady lead flipping track ids -> vRel jitter -> follow-hunting). Telemetry only.
+  # Also derives same_track_noise: a bimodal/bouncing vLead while radarTrackId sat CONSTANT the whole window
+  # -- i.e. the id evidence pins the noise to one physical object (a Doppler/fusion-noisy velocity read on one
+  # real lead), so it is safe to feed the smoother (see _LeadSmoother). A bimodal vLead WITH the id also
+  # changing stays outside same_track_noise (could be two really-different real objects at different speeds)
+  # and is left unmitigated, same as before. dRel track-jumps are deliberately excluded here: while status
+  # stays True (this class's own precondition), a repeated FARTHER dRel jump is already absorbed by
+  # _JumpGuard upstream (same SWITCH_DREL threshold), so adding it here would just double up on the same
+  # signal rather than covering a real gap.
   def __init__(self):
     self._v = deque(maxlen=STABILITY_WINDOW)
     self._d = deque(maxlen=STABILITY_WINDOW)
     self._id = deque(maxlen=ID_CHURN_WINDOW)
     self.unstable = False
     self.churn = False
+    self.same_track_noise = False
 
   def reset(self):
     self._v.clear()
@@ -247,6 +262,7 @@ class _LeadStability:
     self._id.clear()
     self.unstable = False
     self.churn = False
+    self.same_track_noise = False
 
   def update(self, lead, v_ego: float) -> None:
     if not lead.status or v_ego < CREEP_PASSTHROUGH_V:
@@ -262,7 +278,10 @@ class _LeadStability:
     d_jumps = sum(abs(b - a) > SWITCH_DREL for a, b in zip(self._d, list(self._d)[1:], strict=False))
     ids = list(self._id)
     id_churn = sum(1 for a, b in zip(ids, ids[1:], strict=False) if a != b and a > 0 and b > 0)
+    recent_ids = ids[-STABILITY_WINDOW:]
+    same_track = recent_ids[0] > 0 and len(set(recent_ids)) == 1
     self.churn = id_churn >= ID_CHURN and v_spread <= VLEAD_SPREAD   # steady lead, flipping ids (not bimodal)
+    self.same_track_noise = same_track and v_spread > VLEAD_SPREAD
     self.unstable = v_spread > VLEAD_SPREAD or d_jumps >= 2 or self.churn
 
 
@@ -333,14 +352,15 @@ class RadarDistanceController:
     if not self._enabled:
       return radarstate                                       # off: byte-stock passthrough
     two = radarstate.leadTwo
+    noisy = self._stability.churn or self._stability.same_track_noise
     if self._v_ego >= LOW_SPEED_PASSTHROUGH_V:
       one = self._jump_guard.step(radarstate.leadOne)         # reject a same-cycle farther-jump transient ...
       one = self._one.step(one)                               # ... + flicker-hold ...
       two = self._two.step(radarstate.leadTwo)
-      one = self._smoother.update(one, self._stability.churn) # ... + churn de-jitter (anti follow-hunt)
+      one = self._smoother.update(one, noisy)                 # ... + same-object de-jitter (anti follow-hunt)
     elif self._v_ego >= CREEP_PASSTHROUGH_V:
-      # creep band: churn de-jitter ONLY (symmetric EMA), no flicker-hold (a stale held lead would delay launch)
-      one = self._smoother.update(radarstate.leadOne, self._stability.churn)
+      # creep band: de-jitter ONLY (symmetric EMA), no flicker-hold (a stale held lead would delay launch)
+      one = self._smoother.update(radarstate.leadOne, noisy)
     else:
       one = radarstate.leadOne                                # full standstill: no hold/smoothing
     one = self._stop_gap_bias(one)                            # low-speed near-stopped: settle farther back

@@ -84,6 +84,20 @@ LEAD_BRAKE_FACTOR_V = {
   SPORT:  [0.45, 1.0],
 }
 
+# --- Closing-rate jerk-cost relaxation (MPC INPUT: react faster to a fast-closing gap, any cause) ----------
+# Complements LEAD_BRAKE_FACTOR_V, which keys off the LEAD's own deceleration: a gap can close quickly for
+# reasons aLeadK never reflects (a cut-in, or ego simply catching up faster than the lead is slowing). Onset
+# relax (above) only reacts the cycle AFTER a_ego has already crossed its deadband -- reactive on a realized
+# signal, so it structurally can't soften the very first jab into a fresh, fast-closing gap. vRel is an MPC
+# INPUT (causal, known before any brake is commanded), so keying off it directly closes that gap. No lead, or
+# not closing past the gate -> 1.0. Disabled -> 1.0.
+CLOSING_VREL_BP = [-6.0, -1.5]          # m/s, closing rate (negative = closing), ascending for np.interp
+CLOSING_FACTOR_V = {
+  ECO:    [0.75, 1.0],
+  NORMAL: [0.60, 1.0],
+  SPORT:  [0.45, 1.0],
+}
+
 # --- Follow-gap widen (add-only, fed to the MPC t_follow) ------------------------------------------------
 # Add a small speed-dependent widen to the stock t_follow (the driver's gap-button value). Wider gap ->
 # MPC brakes earlier + gentler onto a slowing lead and settles a roomier cruise gap. Invariants:
