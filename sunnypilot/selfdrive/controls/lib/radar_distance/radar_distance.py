@@ -44,7 +44,14 @@ LOW_SPEED_PASSTHROUGH_V = 5.0   # m/s: below this, no flicker-hold (holding a st
                                 # delay the launch); the churn smoother still runs down to CREEP_PASSTHROUGH_V
 CREEP_PASSTHROUGH_V = 1.0       # m/s: below this, full byte-stock passthrough (protect the stock stop distance)
 
-SWITCH_DREL = 8.0              # m, dRel jump = a track switch (used by the instability detector + jump-guard)
+SWITCH_DREL = 4.0               # m, dRel jump = a track switch (used by the instability detector + jump-guard).
+# Route 550a71ee4c7a7fbe/000004b4, t~976.1s: a real fusion-glitch bounce (17.7<->12.3m across ~3 radar
+# cycles, ~0.3s) sailed through both mechanisms at the old 8.0 threshold -- physically impossible for one
+# real object at the vRel logged alongside it (~1-2 m/s closing would take seconds to cover 5m, not 0.1s).
+# Telemetry (all 4 routes in that session, ~230-280k dRel-diff samples/route) shows a clean separation: the
+# 99.5th-percentile ORDINARY frame-to-frame jitter is under ~2m on 3 of 4 routes (the 4th runs hotter due to
+# genuinely more real target changes, not noise -- see radar_distance tests/telemetry notes), while glitch
+# jumps cluster well above 4m. 4.0 sits with margin on both sides of that gap.
 
 # Jump-guard: a same-cycle dRel jump this far FARTHER, on a lead that never dropped status, is treated as a
 # fusion transient (not a real sudden separation) and held at the last-trusted value for a bounded number of

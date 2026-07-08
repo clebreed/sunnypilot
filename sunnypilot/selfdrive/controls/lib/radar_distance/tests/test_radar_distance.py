@@ -278,6 +278,30 @@ def test_jump_guard_off_when_disabled():
   assert c.smooth_radarstate(r) is r                 # disabled -> raw passthrough, no guard
 
 
+def test_jump_guard_replays_real_route_sub_threshold_bounce():
+  # route 550a71ee4c7a7fbe/000004b4--2bd66184db, t~976.08-976.48: dRel bounced 17.70 -> 12.32 -> ... -> 17.15
+  # -> 12.04m across ~0.4s while vRel stayed -0.8 to -2.4 m/s -- physically impossible for one real object
+  # at that closing speed (5m in ~0.1s would need ~50 m/s, not ~1-2). This is the case that motivated
+  # lowering SWITCH_DREL from 8.0 to 4.0: the farther excursion (12.24 -> 17.15, a 4.91m jump) sailed through
+  # unguarded at the old threshold, producing a false-relief-then-correction whipsaw. A closer jump (e.g.
+  # 17.70 -> 12.32) always passes immediately regardless of threshold -- that invariant is untouched here.
+  c = ctrl()
+  raw = [
+    (19.12, -2.32, 9.22, -0.67, -1), (17.95, -2.06, 9.39, -0.58, -1), (18.06, -1.90, 9.49, -0.60, -1),
+    (17.70, -1.84, 9.44, -0.52, -1), (12.32, -1.20, 10.01, -0.02, 2449), (12.12, -1.40, 9.75, -1.60, 2427),
+    (12.56, -1.20, 9.87, -1.45, 2427), (12.24, -1.05, 9.92, -1.29, 2427), (17.15, -2.39, 8.53, -0.85, -1),
+    (12.04, -0.82, 10.02, -0.97, 2427), (12.04, -0.82, 9.94, -0.85, 2427), (11.80, -0.85, 9.81, -0.78, 2427),
+  ]
+  out = None
+  seen = []
+  for dRel, vRel, vLead, aLeadK, tid in raw:
+    out = c.smooth_radarstate(rs(lead(dRel=dRel, vRel=vRel, vLead=vLead, aLeadK=aLeadK, radarTrackId=tid)))
+    seen.append(out.leadOne.dRel)
+  assert seen[4] == pytest.approx(12.32)          # the initial closer jump (17.70->12.32) passes immediately
+  assert seen[8] < 14.0                            # the 12.24->17.15 farther excursion is held, not passed
+  assert out.leadOne.dRel == pytest.approx(11.80)  # recovers exactly once raw resumes reporting close values
+
+
 def test_jump_guard_boundary_not_triggered():
   c = ctrl()
   c.smooth_radarstate(rs(lead(dRel=30.0, vRel=-2.0, vLead=18.0)))
