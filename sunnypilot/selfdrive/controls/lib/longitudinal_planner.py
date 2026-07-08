@@ -22,16 +22,18 @@ from openpilot.sunnypilot.models.helpers import get_active_bundle
 DecState = custom.LongitudinalPlanSP.DynamicExperimentalControl.DynamicExperimentalControlState
 LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
 
-# Bounds how fast output_a_target may drop in the short window right after DEC switches into blended mode
-# for a routine (non-urgent) reason. Never active during an emergency/FCW-triggered switch (dec.smoothing_
-# transition() is false then) -- see DynamicExperimentalController.smoothing_transition().
+# Bounds how fast output_a_target may drop while blended and NOT currently urgent (continuous -- not just a
+# short window right after the switch; see DynamicExperimentalController.smoothing_transition()/is_urgent()).
+# Never active during a genuine emergency (FCW, or a model slow-down past the urgent-severity threshold) at
+# any point, whether that was true at the moment of the switch or only became true later while still blended.
 TRANSITION_MAX_DROP_PER_CYCLE = 0.15   # m/s^2 per cycle
 
 
 class _E2ETransitionGuard:
-  # Without this, the e2e model's own action.desiredAcceleration -- which may have sat meaningfully negative
-  # for a while, hidden because acc-only mode was ignoring it -- becomes binding the instant DEC switches to
-  # blended, producing a same-cycle discontinuous brake. Only ever limits a DOWNWARD move; never delays a rise.
+  # Without this, the e2e model's own action.desiredAcceleration -- which the core MPC-side jerk_scale never
+  # shapes (it only touches the MPC's own solution, not this raw model path) -- can drop sharply frame-to-
+  # frame at any point while blended, not only at the instant DEC switches into it, producing a discontinuous
+  # brake with zero jerk shaping. Only ever limits a DOWNWARD move; never delays a rise.
   def __init__(self):
     self._last = None
 
@@ -105,7 +107,9 @@ class LongitudinalPlannerSP:
   def update(self, sm: messaging.SubMaster) -> None:
     self.events_sp.clear()
     self.dec.update(sm)
-    self.accel.update(sm)
+    # lead_unstable() reflects the previous cycle's radar_distance stability check (this cycle's hasn't run
+    # yet -- see AccelController.update's docstring) -- gates the accel-side lead-keyed relax off a glitch.
+    self.accel.update(sm, lead_unstable=self.radar_distance.lead_unstable())
     self.radar_distance.update(sm)
     self.e2e_alerts_helper.update(sm, self.events_sp)
 

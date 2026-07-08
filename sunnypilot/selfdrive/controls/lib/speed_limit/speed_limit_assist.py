@@ -92,8 +92,7 @@ class SpeedLimitAssist:
     self._minus_hold = 0.
     self._last_carstate_ts = 0.
 
-    # TODO-SP: SLA's own output_a_target for planner
-    # Solution functions mapped to respective states
+    # Solution functions mapped to respective states (dispatched from get_a_target_from_control)
     self.acceleration_solutions = {
       SpeedLimitAssistState.disabled: self.get_current_acceleration_as_target,
       SpeedLimitAssistState.inactive: self.get_current_acceleration_as_target,
@@ -135,9 +134,14 @@ class SpeedLimitAssist:
     # Fallback
     return V_CRUISE_UNSET
 
-  # TODO-SP: SLA's own output_a_target for planner
   def get_a_target_from_control(self) -> float:
-    return self.a_ego
+    # Dispatches to acceleration_solutions[self.state] -- a real per-state decel/accel estimate (kinematic
+    # distance-to-limit formula while adapting, offset-over-horizon while active/holding) instead of echoing
+    # a_ego. Clipped to LIMIT_MIN_ACC/LIMIT_MAX_ACC: this is a comfort bound on the VALUE HANDED TO THE MPC AS
+    # ITS INITIAL STATE (x0), not a brake cap -- the MPC's own solve is free to command more decel than this
+    # from that starting point, so clipping here can't reduce achievable braking.
+    solution = self.acceleration_solutions.get(self.state, self.get_current_acceleration_as_target)
+    return max(LIMIT_MIN_ACC, min(LIMIT_MAX_ACC, solution()))
 
   def update_params(self) -> None:
     if self.frame % int(PARAMS_UPDATE_PERIOD / DT_MDL) == 0:

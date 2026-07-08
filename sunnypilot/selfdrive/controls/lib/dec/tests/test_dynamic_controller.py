@@ -106,9 +106,11 @@ def test_smoothing_transition_false_while_never_switched(mock_cp, mock_mpc, defa
   assert not controller.smoothing_transition()
 
 
-def test_smoothing_transition_true_right_after_routine_switch_then_lapses(mock_cp, mock_mpc, default_sm):
-  # a standstill-driven switch is routine (not FCW/immediate) -- smoothing must engage exactly at the switch
-  # and lapse again after WMACConstants.TRANSITION_SMOOTH_FRAMES, staying in blended the whole time.
+def test_smoothing_transition_true_right_after_routine_switch_and_stays_true(mock_cp, mock_mpc, default_sm):
+  # a standstill-driven switch is routine (not FCW/immediate) -- smoothing must engage at the switch and,
+  # since the moment stays non-urgent, keep applying continuously (no more time-boxed lapse) as long as we
+  # stay in blended and nothing urgent shows up -- see test_smoothing_transition_turns_off_when_urgency_rises
+  # for the case that DOES turn it off.
   controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
   default_sm['radarState'] = MockRadarState(status=0.0)
   default_sm['carState'].standstill = True
@@ -124,7 +126,45 @@ def test_smoothing_transition_true_right_after_routine_switch_then_lapses(mock_c
   for _ in range(WMACConstants.TRANSITION_SMOOTH_FRAMES + 2):
     controller.update(default_sm)
   assert controller.mode() == "blended"
-  assert not controller.smoothing_transition()   # lapsed after the window, still in blended
+  assert controller.smoothing_transition()   # still non-urgent -- no time-based lapse anymore
+
+
+def test_smoothing_transition_turns_off_when_urgency_rises_while_already_blended(mock_cp, mock_mpc, default_sm):
+  # The gap this fixes: entering blended for a ROUTINE reason (standstill) must not permanently exempt a
+  # LATER genuine emergency that appears while already blended -- the old last_switch_was_immediate snapshot
+  # only looked at how we entered, never re-checked. is_urgent() re-checks every cycle instead.
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+  default_sm['carState'].standstill = True
+  for _ in range(20):
+    controller.update(default_sm)
+  assert controller.mode() == "blended"
+  assert controller.smoothing_transition()
+  assert not controller.is_urgent()
+
+  mock_mpc.crash_cnt = 1   # a new FCW appears, still in blended (standstill keeps it there)
+  controller.update(default_sm)
+  assert controller.mode() == "blended"   # no mode switch needed/observed -- already blended
+  assert controller.is_urgent()
+  assert not controller.smoothing_transition()   # must turn off immediately, same cycle
+
+
+def test_is_urgent_true_on_fcw(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  mock_mpc.crash_cnt = 1
+  controller.update(default_sm)
+  assert controller.is_urgent()
+
+
+def test_is_urgent_false_for_routine_slowdown_below_threshold(mock_cp, mock_mpc, default_sm):
+  # a mild slow-down (not near the URGENT_SLOW_DOWN_PROB severity) must not read as urgent.
+  mock_cp.radarUnavailable = True
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+  default_sm['modelV2'] = MockModelData(valid=True, desired_acceleration=-0.6)   # just past MODEL_DECEL_START
+  controller.update(default_sm)
+  assert controller._raw_urgency < WMACConstants.URGENT_SLOW_DOWN_PROB
+  assert not controller.is_urgent()
 
 
 def test_smoothing_transition_false_for_emergency_switch(mock_cp, mock_mpc, default_sm):

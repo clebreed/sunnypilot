@@ -16,12 +16,14 @@ from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
+from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import PCM_LONG_REQUIRED_MAX_SET_SPEED
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist, \
-  PRE_ACTIVE_GUARD_PERIOD, ACTIVE_STATES
+  PRE_ACTIVE_GUARD_PERIOD, ACTIVE_STATES, LIMIT_MIN_ACC, LIMIT_MAX_ACC
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 
 SpeedLimitAssistState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
@@ -243,7 +245,36 @@ class TestSpeedLimitAssist:
 
     self.sla.update(True, False, current_speed, 0, self.pcm_long_max_set_speed, target_speed, target_speed, True, distance, self.events_sp)
     assert self.sla.state == SpeedLimitAssistState.adapting
-    assert self.sla.output_v_target == target_speed  # TODO-SP: assert expected accel, need to enable self.acceleration_solutions
+    assert self.sla.output_v_target == target_speed
+    # kinematic (target^2 - current^2) / (2*distance) is well past LIMIT_MIN_ACC here -> clipped
+    expected_raw = (target_speed ** 2 - current_speed ** 2) / (2. * distance)
+    assert expected_raw < LIMIT_MIN_ACC
+    assert self.sla.output_a_target == pytest.approx(LIMIT_MIN_ACC)
+
+  def test_active_state_uses_offset_over_horizon_formula(self):
+    self.initialize_active_state(self.pcm_long_max_set_speed)
+    target_speed = SPEED_LIMITS['highway']
+    current_speed = target_speed - 1.0   # small offset, stays within the clip band
+
+    self.sla.update(True, False, current_speed, 0, self.pcm_long_max_set_speed, target_speed, target_speed, True, 0, self.events_sp)
+    assert self.sla.state == SpeedLimitAssistState.active
+    expected = (target_speed - current_speed) / float(ModelConstants.T_IDXS[CONTROL_N])
+    assert LIMIT_MIN_ACC < expected < LIMIT_MAX_ACC   # sanity: this case is meant to land inside the clip band
+    assert self.sla.output_a_target == pytest.approx(expected)
+
+  def test_a_target_clipped_to_max_acc(self):
+    self.sla.state = SpeedLimitAssistState.adapting
+    self.sla.v_cruise_cluster_prev = self.pcm_long_max_set_speed
+    self.sla.prev_v_cruise_cluster_conv = round(self.pcm_long_max_set_speed * self.speed_conv)
+
+    distance = 1.0   # tiny distance -> a large positive kinematic solution -> clipped
+    current_speed = SPEED_LIMITS['city']
+    target_speed = SPEED_LIMITS['highway']
+
+    self.sla.update(True, False, current_speed, 0, self.pcm_long_max_set_speed, target_speed, target_speed, True, distance, self.events_sp)
+    expected_raw = (target_speed ** 2 - current_speed ** 2) / (2. * distance)
+    assert expected_raw > LIMIT_MAX_ACC
+    assert self.sla.output_a_target == pytest.approx(LIMIT_MAX_ACC)
 
   def test_long_disengaged_to_disabled(self):
     self.initialize_active_state(self.pcm_long_max_set_speed)

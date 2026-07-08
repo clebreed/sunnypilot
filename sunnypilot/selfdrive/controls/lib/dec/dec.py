@@ -188,14 +188,23 @@ class DynamicExperimentalController:
   def active(self) -> bool:
     return self._active
 
+  def is_urgent(self) -> bool:
+    # Same "immediate" criterion _desired_mode() uses to decide a mode switch can't wait: an FCW-flagged MPC,
+    # or a model slow-down whose smoothed hysteresis has latched AND whose raw severity clears the urgent
+    # threshold. Public so callers outside the mode-switch decision (e.g. smoothing_transition) can reuse the
+    # identical, already-tuned definition of "this is not a routine moment" instead of inventing a second one.
+    return self._has_mpc_fcw or (self._has_slow_down and self._raw_urgency > WMACConstants.URGENT_SLOW_DOWN_PROB)
+
   def smoothing_transition(self) -> bool:
-    # True for a short window right after switching into blended for a ROUTINE (non-urgent) reason -- the
-    # e2e model's own action.desiredAcceleration may have sat meaningfully negative while acc-only mode
-    # ignored it, so the instant of the switch can otherwise read as a same-cycle discontinuous brake.
-    # Never true for an emergency/FCW-triggered (immediate) switch -- those must never be smoothed/delayed.
-    mgr = self._mode_manager
-    return (mgr.current_mode == 'blended' and not mgr.last_switch_was_immediate and
-            mgr.frames_since_switch < WMACConstants.TRANSITION_SMOOTH_FRAMES)
+    # True continuously while blended and NOT currently urgent -- not just for a short window right after the
+    # switch. The e2e model's own action.desiredAcceleration can otherwise drop sharply frame-to-frame at any
+    # point while steady-state in blended (not only at the switch instant), with zero jerk shaping from
+    # either this fork's MPC-side relax (jerk_scale never touches the e2e path) or the old switch-scoped-only
+    # version of this guard. Checking is_urgent() every cycle (not just "was the switch immediate") also
+    # covers a new emergency that appears AFTER a routine switch, which the old snapshot-at-switch-time
+    # check couldn't. Never true during a genuine emergency at any point, so it never delays/softens a real
+    # stop the model or FCW is trying to make happen sooner.
+    return self._mode_manager.current_mode == 'blended' and not self.is_urgent()
 
   def set_mpc_fcw_crash_cnt(self) -> None:
     self._mpc_fcw_crash_cnt = self._mpc.crash_cnt
