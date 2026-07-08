@@ -204,6 +204,33 @@ def test_stop_gap_creep_below_threshold_never_releases():
   assert out.leadOne.dRel < 6.0 - 1e-6                # vLead never exceeds the creep threshold -> stays biased
 
 
+def test_stop_gap_creep_intermittent_noise_never_releases():
+  # route 550a71ee4c7a7fbe/000004b6--d4a8ac3352, t~678-690s: a genuinely-stopped lead's vLead noise blipped
+  # above STOP_GAP_CREEP_V on roughly half the frames (never below zero motion overall, never sustained) --
+  # the old monotonic-only counter still accumulated those blips to the cap over enough frames and falsely
+  # latched the bias off mid-stop, producing a same-cycle jump in the reported gap. Alternating strictly
+  # above/below the threshold every frame, for far longer than STOP_GAP_CREEP_HOLD_FRAMES, must never release.
+  c = ctrl(v_ego=0.0)
+  out = None
+  for i in range(STOP_GAP_CREEP_HOLD_FRAMES * 4):
+    vLead = STOP_GAP_CREEP_V + 0.05 if i % 2 == 0 else 0.0
+    out = c.smooth_radarstate(rs(lead(dRel=6.0, vLead=vLead)))
+  assert out.leadOne.dRel < 6.0 - 1e-6                # never sustained -> never releases, even after 4x the hold
+
+
+def test_stop_gap_creep_sustained_after_intermittent_noise_still_releases():
+  # the decay must not make the override permanently harder to reach -- real sustained motion right after a
+  # noisy patch still releases within the normal HOLD window (decay only undoes noise, doesn't add a penalty).
+  c = ctrl(v_ego=0.0)
+  for i in range(STOP_GAP_CREEP_HOLD_FRAMES):
+    vLead = STOP_GAP_CREEP_V + 0.05 if i % 2 == 0 else 0.0
+    c.smooth_radarstate(rs(lead(dRel=6.0, vLead=vLead)))
+  out = None
+  for _ in range(STOP_GAP_CREEP_HOLD_FRAMES + 5):
+    out = c.smooth_radarstate(rs(lead(dRel=6.0, vLead=STOP_GAP_CREEP_V + 0.05)))
+  assert out.leadOne.dRel == pytest.approx(6.0)       # sustained motion still releases in bounded time
+
+
 def test_low_speed_override_lead_passthrough():
   # radard low_speed_override emits a real closest-track lead with modelProb=0.0. It must be honored, not
   # rejected in favor of a stale farther held lead (which would under-brake / stop too close).

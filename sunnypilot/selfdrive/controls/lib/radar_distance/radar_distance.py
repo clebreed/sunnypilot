@@ -86,7 +86,13 @@ STOP_GAP_MIN_DREL = 2.0        # m: never report a lead closer than this
 # suppressing a real, growing gap the whole time -- observed on real telemetry as a 9+ second launch delay
 # (the bias reported the lead ~1.8m closer than reality for the entire creep, so the MPC saw almost no gap
 # growth to react to). Any sustained motion this long overrides the bias off regardless of how slow that
-# motion is -- sustained creep means launching, not settling into a stop.
+# motion is -- sustained creep means launching, not settling into a stop. The frame counter decays (not just
+# holds) on a sub-threshold frame, so it takes SUSTAINED motion, not merely cumulative noise straddling the
+# threshold, to reach the cap -- route 550a71ee4c7a7fbe/000004b6, t~678-690s: a genuinely-stopped lead's vLead
+# noise (small blips above 0.03 m/s with no real motion) still crossed the threshold often enough to
+# eventually hit the old monotonic-only counter's cap, latching the bias permanently off mid-stop. That
+# produced a same-cycle ~2m+ jump in the reported gap (the MPC saw "more room" appear out of nowhere) right
+# as the car was holding a stop -- one clear trigger for the observed launch-then-brake-back cycling.
 STOP_GAP_CREEP_V = 0.03        # m/s: a truly-stopped lead reads exactly 0.0; treat anything above this as motion
 STOP_GAP_CREEP_HOLD_S = 1.5    # s: this much sustained motion overrides the bias off
 STOP_GAP_CREEP_HOLD_FRAMES = int(STOP_GAP_CREEP_HOLD_S / DT_MDL)
@@ -343,9 +349,13 @@ class RadarDistanceController:
     if lead.vLead > STOP_GAP_CREEP_V:
       self._creep_frames = min(self._creep_frames + 1, STOP_GAP_CREEP_HOLD_FRAMES)
       if self._creep_frames >= STOP_GAP_CREEP_HOLD_FRAMES:
-        self._creep_released = True                          # latched: a single-frame near-zero blip afterward
-    if self._creep_released:                                 # (e.g. sensor noise mid-creep) can't re-suppress it
-      return lead
+        self._creep_released = True
+    else:
+      # decay: a sub-threshold frame undoes one frame of "motion" credit, so only SUSTAINED motion (not
+      # cumulative noise straddling the threshold) can reach the cap.
+      self._creep_frames = max(self._creep_frames - 1, 0)
+    if self._creep_released:                          # once latched: sticky -- a single-frame near-zero blip
+      return lead                                      # afterward (e.g. sensor noise mid-creep) can't re-suppress it
 
     d_ramp = min(max((STOP_GAP_REGIME_DREL - lead.dRel) / STOP_GAP_RAMP_BAND, 0.0), 1.0)
     v_ramp = min(max((STOP_GAP_VLEAD - lead.vLead) / STOP_GAP_VLEAD, 0.0), 1.0)
