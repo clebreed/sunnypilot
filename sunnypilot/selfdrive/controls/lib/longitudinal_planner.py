@@ -69,10 +69,20 @@ class LongitudinalPlannerSP:
 
   def is_e2e(self, sm: messaging.SubMaster) -> bool:
     experimental_mode = sm['selfdriveState'].experimentalMode
-    if not self.dec.active():
-      return experimental_mode
+    if not experimental_mode:
+      return False
 
-    return experimental_mode and self.dec.mode() == "blended"
+    # A near/fast-closing radar lead always routes to pure MPC, regardless of whether DEC itself is on --
+    # this baseline is not something the DEC toggle should be able to bypass (dec.has_radar_acc_lead() is
+    # computed every cycle independent of dec.active()). DEC's own toggle only gates the OTHER blended
+    # triggers (standstill, slow-down, FCW) below.
+    if self.dec.has_radar_acc_lead():
+      return False
+
+    if not self.dec.active():
+      return True
+
+    return self.dec.mode() == "blended"
 
   def update_targets(self, sm: messaging.SubMaster, v_ego: float, a_ego: float, v_cruise: float) -> tuple[float, float]:
     CS = sm['carState']

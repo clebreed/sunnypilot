@@ -188,6 +188,13 @@ class DynamicExperimentalController:
   def active(self) -> bool:
     return self._active
 
+  def has_radar_acc_lead(self) -> bool:
+    # Same criterion _desired_mode() uses to force 'acc' mode: a near or fast-closing radar lead is trusted
+    # enough that the e2e model's own opinion should never blend in over pure MPC. Computed every cycle
+    # regardless of the DEC param/active() state (see _update_calculations, called unconditionally from
+    # update()), so callers can use this as a lead-safety baseline independent of whether DEC itself is on.
+    return not self._CP.radarUnavailable and self._has_radar_acc_lead
+
   def is_urgent(self) -> bool:
     # Same "immediate" criterion _desired_mode() uses to decide a mode switch can't wait: an FCW-flagged MPC,
     # or a model slow-down whose smoothed hysteresis has latched AND whose raw severity clears the urgent

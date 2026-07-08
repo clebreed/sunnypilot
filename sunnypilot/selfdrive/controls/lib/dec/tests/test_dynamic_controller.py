@@ -311,3 +311,42 @@ def test_lead_flicker_hold_prevents_one_frame_mode_flip(mock_cp, mock_mpc, defau
 
   assert controller._has_lead_filtered
   assert controller.mode() == "acc"
+
+
+def test_has_radar_acc_lead_true_for_near_lead(mock_cp, mock_mpc, default_sm):
+  # within RADAR_LEAD_ACC_MAX_DREL -- available regardless of whether DEC's own param/active() is on, since
+  # _update_calculations runs every cycle unconditionally.
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=1.0, dRel=40.0, vRel=0.0)
+  controller.update(default_sm)
+  assert controller.has_radar_acc_lead()
+
+
+def test_has_radar_acc_lead_false_for_far_slow_lead(mock_cp, mock_mpc, default_sm):
+  # beyond MAX_DREL and not closing fast enough for the TTC gate -- correctly not trusted as an ACC-safe lead.
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=1.0, dRel=120.0, vRel=0.0)
+  controller.update(default_sm)
+  assert not controller.has_radar_acc_lead()
+
+
+def test_has_radar_acc_lead_false_when_radar_unavailable(mock_cp, mock_mpc, default_sm):
+  mock_cp.radarUnavailable = True
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=1.0, dRel=40.0, vRel=0.0)
+  controller.update(default_sm)
+  assert not controller.has_radar_acc_lead()
+
+
+def test_has_radar_acc_lead_independent_of_dec_param(mock_cp, mock_mpc, default_sm):
+  # DEC disabled (param False) must not affect this -- it's a lead-safety baseline other callers rely on
+  # regardless of whether DEC itself is on.
+  class MockParamsOff:
+    def get_bool(self, name):
+      return False
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParamsOff())
+  default_sm['radarState'] = MockRadarState(status=1.0, dRel=40.0, vRel=0.0)
+  controller.update(default_sm)
+  assert not controller.enabled()
+  assert not controller.active()
+  assert controller.has_radar_acc_lead()
